@@ -113,7 +113,7 @@ test("due item waits for a running agent, then for subagents, then sends", async
     f.state.tree = { busy: true, reason: "子 Agent「worker」运行中" };
     await f.scheduler.sweep(f.port);
     assert.equal(f.sent.length, 0);
-    assert.equal(f.scheduler.getWaitingReason("a1"), "子 Agent「worker」运行中");
+    assert.match(f.scheduler.getWaitingReason("a1"), /^子 Agent「worker」运行中 · 最多再等/);
 
     f.state.tree = { busy: false, reason: null };
     await f.scheduler.sweep(f.port);
@@ -291,5 +291,46 @@ test("cc lookup failures resolve instead of rejecting", async () => {
     assert.match(f.scheduler.getWaitingReason("a1"), /读取 Agent 状态失败/);
   } finally {
     f.cleanup();
+  }
+});
+
+test("cc wait limit: a due message waits for subagents at most the limit, never past a running root", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccq-limit-"));
+  try {
+    const store = new QueueStore(path.join(dir, "q.json"));
+    const clock = { now: T0 };
+    const state = { status: "idle" };
+    const sent = [];
+    const scheduler = new TimedQueueScheduler(store, {
+      now: () => clock.now,
+      maxTreeWaitMs: () => 60 * MIN,
+    });
+    const port = {
+      async inspect(id) {
+        return { id, status: state.status, pendingPermissions: [] };
+      },
+      async inspectTree() {
+        return { busy: true, reason: "主 Agent有 1 个子任务在跑" };
+      },
+      async send(_agentId, text) {
+        sent.push(text);
+      },
+    };
+    await scheduler.submit(port, "a1", { text: "timed" }, 10);
+    clock.now += 10 * MIN; // due
+    await scheduler.sweep(port);
+    assert.match(scheduler.getWaitingReason("a1"), /子任务在跑 · 最多再等 60 分钟/);
+
+    clock.now += 61 * MIN;
+    state.status = "running";
+    await scheduler.sweep(port);
+    assert.equal(sent.length, 0);
+
+    state.status = "idle";
+    await scheduler.sweep(port);
+    assert.deepEqual(sent, ["timed"]);
+    assert.match(scheduler.getTimeoutNotice("a1"), /超过 60 分钟/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

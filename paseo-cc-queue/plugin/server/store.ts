@@ -265,6 +265,11 @@ export class QueueStore {
     return result;
   }
 
+  /** The due item the next dispatch would send, without removing it. */
+  peekDue(agentId: string, nowMs: number = Date.now()): StoredQueuedItem | null {
+    return this.hasDueItems(agentId, nowMs) ? this.queues.get(agentId)!.items[0] : null;
+  }
+
   shiftDue(agentId: string, nowMs: number = Date.now()): StoredQueuedItem | null {
     if (!this.hasDueItems(agentId, nowMs)) return null;
     const record = this.queues.get(agentId)!;

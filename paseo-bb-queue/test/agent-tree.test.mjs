@@ -203,7 +203,7 @@ test("scheduler: sweep dispatches once the whole tree is quiet", async () => {
     await f.settle();
     await f.scheduler.sweep(f.port);
     assert.equal(f.sent.length, 0, "still busy while subagents run");
-    assert.equal(f.scheduler.getWaitingReason("root"), "子 Agent 运行中");
+    assert.match(f.scheduler.getWaitingReason("root"), /^子 Agent 运行中 · 最多再等 60 分钟$/);
     f.state.tree = { busy: false, reason: null };
     await f.scheduler.sweep(f.port);
     assert.deepEqual(f.sent, [{ agentId: "root", text: "next task" }]);
@@ -327,5 +327,110 @@ test("provider subagent tracker: a rejected subscription neither throws nor retr
     assert.ok(errors.some((line) => line.includes("subscription failed")));
   } finally {
     console.error = original;
+  }
+});
+
+// ---- subagent wait limit ----
+import { TreeWaitLimiter } from "../plugin/server/agent-tree.ts";
+
+test("wait limiter: counts down, then lets the message through; 0 means wait forever", () => {
+  let now = NOW;
+  const limiter = new TreeWaitLimiter({ maxWaitMs: () => 60 * 60_000, now: () => now });
+  assert.deepEqual(limiter.evaluate("root", "i1", "子 Agent 运行中"), {
+    send: false,
+    reason: "子 Agent 运行中 · 最多再等 60 分钟",
+  });
+  now += 59 * 60_000 + 30_000;
+  assert.match(limiter.evaluate("root", "i1", "x").reason, /最多再等 1 分钟/);
+  now += 30_000;
+  assert.deepEqual(limiter.evaluate("root", "i1", "x"), { send: true, reason: null });
+
+  const unlimited = new TreeWaitLimiter({ maxWaitMs: () => 0, now: () => now });
+  unlimited.evaluate("root", "i1", "x");
+  now += 24 * 60 * 60_000;
+  assert.deepEqual(unlimited.evaluate("root", "i1", "子 Agent 运行中"), {
+    send: false,
+    reason: "子 Agent 运行中",
+  });
+});
+
+test("wait limiter: a new head message starts a new clock", () => {
+  let now = NOW;
+  const limiter = new TreeWaitLimiter({ maxWaitMs: () => 10 * 60_000, now: () => now });
+  limiter.evaluate("root", "i1", "x");
+  now += 11 * 60_000;
+  assert.match(limiter.evaluate("root", "i2", "x").reason, /最多再等 10 分钟/);
+});
+
+function limitFixture() {
+  const dir = mkdtempSync(path.join(tmpdir(), "bbq-limit-"));
+  const store = new QueueStore(path.join(dir, "queues.json"));
+  const clock = { now: NOW };
+  const scheduler = new QueueScheduler(store, {
+    turnEndGraceMs: 0,
+    maxTreeWaitMs: () => 60 * 60_000,
+    now: () => clock.now,
+  });
+  const state = { status: "idle", tree: { busy: true, reason: "子 Agent「worker」运行中" } };
+  const sent = [];
+  const port = {
+    async inspect(id) {
+      return { id, status: state.status, pendingPermissions: [] };
+    },
+    async inspectTree() {
+      return state.tree;
+    },
+    async send(agentId, text) {
+      sent.push(text);
+    },
+  };
+  return { store, scheduler, clock, state, sent, port, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+test("bb wait limit: root turns do not restart the clock; after 60 min an idle root gets the message", async () => {
+  const f = limitFixture();
+  try {
+    f.store.enqueue("root", { text: "next step" });
+    await f.scheduler.sweep(f.port);
+    assert.match(f.scheduler.getWaitingReason("root"), /子 Agent「worker」运行中 · 最多再等 60 分钟/);
+
+    // A subagent report makes the root run for a while; that time still counts.
+    f.clock.now += 30 * 60_000;
+    f.state.status = "running";
+    await f.scheduler.sweep(f.port);
+    f.clock.now += 31 * 60_000;
+    await f.scheduler.sweep(f.port);
+    assert.equal(f.sent.length, 0, "never sent while the root itself runs, even past the limit");
+
+    f.state.status = "idle";
+    await f.scheduler.sweep(f.port);
+    assert.deepEqual(f.sent, ["next step"]);
+    assert.match(f.scheduler.getTimeoutNotice("root"), /超过 60 分钟，已直接发送「next step」/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("bb wait limit: the next message gets its own clock; pausing resets it", async () => {
+  const f = limitFixture();
+  try {
+    f.store.enqueue("root", { text: "one" });
+    f.store.enqueue("root", { text: "two" });
+    await f.scheduler.sweep(f.port);
+    f.clock.now += 61 * 60_000;
+    await f.scheduler.sweep(f.port);
+    assert.deepEqual(f.sent, ["one"]);
+    await f.scheduler.sweep(f.port);
+    assert.deepEqual(f.sent, ["one"], "'two' starts waiting from now, not from 'one'");
+    assert.match(f.scheduler.getWaitingReason("root"), /最多再等 60 分钟/);
+
+    f.clock.now += 50 * 60_000;
+    f.scheduler.resetTreeWait("root");
+    f.store.setPaused("root", true);
+    f.store.setPaused("root", false);
+    await f.scheduler.sweep(f.port);
+    assert.match(f.scheduler.getWaitingReason("root"), /最多再等 60 分钟/, "pause restarted the clock");
+  } finally {
+    f.cleanup();
   }
 });

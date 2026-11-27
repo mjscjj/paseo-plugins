@@ -337,6 +337,22 @@ export function QueueManagerView({
         </View>
       ) : null}
 
+      {detail?.timeoutNotice ? (
+        <View
+          style={[
+            styles.banner,
+            {
+              backgroundColor: theme.colors.surface1,
+              borderColor: theme.colors.statusWarning,
+            },
+          ]}
+        >
+          <Text style={{ fontSize: 12, color: theme.colors.statusWarning }}>
+            {detail.timeoutNotice}
+          </Text>
+        </View>
+      ) : null}
+
       {!paused && detail?.waitingReason && items.length > 0 ? (
         <View
           style={[

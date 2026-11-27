@@ -247,3 +247,77 @@ export async function inspectAgentTree(
   }
   return { busy: false, reason: null };
 }
+
+/** How long the "sent after the wait limit" notice stays visible. */
+export const TIMEOUT_NOTICE_TTL_MS = 30 * 60_000;
+
+export interface TreeWaitDecision {
+  /** True once the wait limit ran out: send although subagents are still busy. */
+  send: boolean;
+  /** Shown while waiting; null when sending. */
+  reason: string | null;
+}
+
+/**
+ * Caps how long one queued message waits for subagents. The clock starts the first time the
+ * root is idle but its tree is busy, keeps running through root turns (each subagent report
+ * would otherwise restart it), and belongs to that one message: a new head starts a new clock.
+ * It never overrides the root's own state; callers only consult it when the root is idle.
+ */
+export class TreeWaitLimiter {
+  private readonly waits = new Map<string, { itemId: string; since: number }>();
+  private readonly notices = new Map<string, { text: string; at: number }>();
+  private readonly maxWaitMs: () => number;
+  private readonly now: () => number;
+
+  constructor(options: { maxWaitMs: () => number; now?: () => number }) {
+    this.maxWaitMs = options.maxWaitMs;
+    this.now = options.now ?? Date.now;
+  }
+
+  evaluate(agentId: string, headItemId: string, busyReason: string | null): TreeWaitDecision {
+    const now = this.now();
+    let entry = this.waits.get(agentId);
+    if (!entry || entry.itemId !== headItemId) {
+      entry = { itemId: headItemId, since: now };
+      this.waits.set(agentId, entry);
+    }
+    const reason = busyReason ?? "子 Agent 运行中";
+    const maxMs = this.maxWaitMs();
+    if (maxMs <= 0) return { send: false, reason };
+    const remaining = entry.since + maxMs - now;
+    if (remaining <= 0) return { send: true, reason: null };
+    return { send: false, reason: `${reason} · 最多再等 ${Math.ceil(remaining / 60_000)} 分钟` };
+  }
+
+  /** The message was sent, withdrawn or the queue paused: its clock is gone. */
+  reset(agentId: string): void {
+    this.waits.delete(agentId);
+  }
+
+  recordTimeout(agentId: string, preview: string): void {
+    const minutes = Math.round(this.maxWaitMs() / 60_000);
+    const at = this.now();
+    const time = new Date(at).toTimeString().slice(0, 5);
+    const short = preview.trim().replace(/\s+/g, " ").slice(0, 30);
+    this.notices.set(agentId, {
+      text: `${time} 等子 Agent 超过 ${minutes} 分钟，已直接发送「${short || "(附件消息)"}」，子 Agent 仍在继续运行`,
+      at,
+    });
+  }
+
+  getNotice(agentId: string): string | null {
+    const notice = this.notices.get(agentId);
+    if (!notice) return null;
+    if (this.now() - notice.at > TIMEOUT_NOTICE_TTL_MS) {
+      this.notices.delete(agentId);
+      return null;
+    }
+    return notice.text;
+  }
+
+  dispose(): void {
+    this.waits.clear();
+    this.notices.clear();
+  }
+}

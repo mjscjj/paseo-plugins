@@ -170,6 +170,7 @@ test("real Paseo daemon E2E: supervisor -> worker -> register.mjs -> bb-queue pl
         withdrawnMessageIds: [],
         dispatchedTexts: {},
         waitingReason: null,
+        timeoutNotice: null,
       });
     } finally {
       await client.close();

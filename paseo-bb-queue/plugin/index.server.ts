@@ -4,6 +4,7 @@ import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin
 import {
   BB_PLUGIN_ID,
   clearQueueRpc,
+  DEFAULT_MAX_SUBAGENT_WAIT_MINUTES,
   enqueueManualRpc,
   getAgentQueueRpc,
   ingestRpc,
@@ -14,6 +15,7 @@ import {
   setFrontendQueueHoldRpc,
   setQueuePausedRpc,
   updateQueueItemRpc,
+  waitSettings,
 } from "./shared/contracts.ts";
 import { ProviderSubagentTracker } from "./server/agent-tree.ts";
 import { createPaseoAgentPort, QueueScheduler } from "./server/scheduler.ts";
@@ -30,7 +32,19 @@ function resolveQueueStoragePath(): string {
 
 export default function contribute(server: PluginServerContext) {
   const store = new QueueStore(resolveQueueStoragePath());
-  const scheduler = new QueueScheduler(store);
+  const settings = server.registerSettings(waitSettings);
+  let maxSubagentWaitMinutes = DEFAULT_MAX_SUBAGENT_WAIT_MINUTES;
+  const applySettings = (state: Awaited<ReturnType<typeof settings.read>>) => {
+    if (state.status === "ready") maxSubagentWaitMinutes = state.values.maxSubagentWaitMinutes;
+  };
+  void settings.read().then(applySettings, (error) => {
+    console.error("[bb-queue] failed to read settings:", error);
+  });
+  const removeSettingsListener = settings.subscribe(applySettings);
+
+  const scheduler = new QueueScheduler(store, {
+    maxTreeWaitMs: () => maxSubagentWaitMinutes * 60_000,
+  });
   const tracker = new ProviderSubagentTracker();
   let lastReconcileAt = 0;
   // Paseo hands the plugin its API only inside handlers and events; it is the same object for
@@ -47,6 +61,7 @@ export default function contribute(server: PluginServerContext) {
   const withWaiting = <T extends { agentId: string }>(detail: T) => ({
     ...detail,
     waitingReason: scheduler.getWaitingReason(detail.agentId),
+    timeoutNotice: scheduler.getTimeoutNotice(detail.agentId),
   });
 
   const sweepTimer = setInterval(() => {
@@ -147,6 +162,7 @@ export default function contribute(server: PluginServerContext) {
   );
 
   server.handle(setQueuePausedRpc, async ({ agentId, paused }, { paseo }) => {
+    if (paused) scheduler.resetTreeWait(agentId);
     const detail = store.setPaused(agentId, paused);
     if (!paused) {
       await scheduler.drainNext(portFor(paseo), agentId);
@@ -155,7 +171,10 @@ export default function contribute(server: PluginServerContext) {
     return withWaiting(detail);
   });
 
-  server.handle(clearQueueRpc, ({ agentId }) => withWaiting(store.clear(agentId)));
+  server.handle(clearQueueRpc, ({ agentId }) => {
+    scheduler.resetTreeWait(agentId);
+    return withWaiting(store.clear(agentId));
+  });
 
   server.on("agent.turn_started", ({ agent }, { paseo }) => {
     portFor(paseo);
@@ -176,6 +195,7 @@ export default function contribute(server: PluginServerContext) {
 
   return () => {
     clearInterval(sweepTimer);
+    removeSettingsListener();
     scheduler.dispose();
     tracker.dispose();
   };

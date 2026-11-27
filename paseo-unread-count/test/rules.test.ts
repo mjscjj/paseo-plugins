@@ -4,7 +4,9 @@ import {
   agentUnreadKind,
   formatAgo,
   formatSidebarLabel,
+  inLiveWorkspace,
   isAwaitingPermission,
+  isLiveWorkspace,
   newestFirst,
 } from "../client/rules.ts";
 
@@ -45,13 +47,31 @@ test("agent 上的 permission 原因不重复计数（审批按工作区算）",
 });
 
 test("等审批：needs_input 的顶层工作区", () => {
-  const ws = { status: "needs_input" as const, background: false, parentAgent: null };
+  const ws = { status: "needs_input" as const, background: false, parentAgent: null, archivingAt: null };
   assert.equal(isAwaitingPermission(ws), true);
   assert.equal(isAwaitingPermission({ ...ws, status: "attention" }), false);
   assert.equal(isAwaitingPermission({ ...ws, background: true }), false);
   assert.equal(
     isAwaitingPermission({ ...ws, parentAgent: { kind: "agent", hostId: "h", id: "p", key: "k" } as never }),
     false,
+  );
+});
+
+test("归档中的工作区不算等审批", () => {
+  const ws = { status: "needs_input" as const, background: false, parentAgent: null };
+  assert.equal(isAwaitingPermission({ ...ws, archivingAt: "2026-11-27T15:00:00.000Z" }), false);
+  assert.equal(isLiveWorkspace({ archivingAt: null }), true);
+  assert.equal(isLiveWorkspace({ archivingAt: "2026-11-27T15:00:00.000Z" }), false);
+});
+
+test("工作区已不在（已归档）的会话不算未看", () => {
+  const live = new Set(["host-a:workspace:w1"]);
+  assert.equal(inLiveWorkspace({ workspace: { key: "host-a:workspace:w1" } }, live), true);
+  assert.equal(inLiveWorkspace({ workspace: { key: "host-a:workspace:gone" } }, live), false);
+  assert.equal(
+    inLiveWorkspace({ workspace: { key: "host-b:workspace:w1" } }, live),
+    false,
+    "同名工作区在别的主机上不算",
   );
 });
 

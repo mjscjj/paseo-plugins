@@ -4,9 +4,13 @@
 
 | 目录 | 插件 ID | 作用 | daemon 加载路径 |
 |---|---|---|---|
-| `paseo-bb-queue/` | `bb-queue` | `bb ` 前缀消息服务端排队；主 agent 及其子 agent 都空闲后才发下一条 | `paseo-bb-queue/plugin` |
-| `paseo-cc-queue/` | `cc-queue` | `cc ` 前缀定时排队，按设置的分钟间隔依次入队 | `paseo-cc-queue/plugin` |
+| `paseo-bb-queue/` | `bb-queue` | `bb ` 前缀消息服务端排队；主 agent 及其子 agent 都空闲后才发下一条，等子 agent 最长 60 分钟（可设置，0 为不限） | `paseo-bb-queue/plugin` |
+| `paseo-cc-queue/` | `cc-queue` | `cc ` 前缀定时排队，按设置的分钟间隔依次入队；到点后同样等子 agent，最长 60 分钟（可设置） | `paseo-cc-queue/plugin` |
 | `paseo-auto-retry/` | `auto-retry` | 因超时、网络、限流或 provider 临时错误中断的轮次自动重试 | `paseo-auto-retry` |
 | `paseo-unread-count/` | `unread-count` | 侧边栏顶部显示所有已连接主机上完成/出错/等审批未看的会话数 | `paseo-unread-count` |
 
 安装或改动后重载：`paseo plugin install <目录>` / `paseo plugin reload <插件 ID>`（不需要重启 daemon）。
+
+例外：`paseo-bb-queue/shim/` 由 systemd drop-in（`~/.config/systemd/user/paseo.service.d/bb-queue.conf`）注入 daemon 进程，负责把 `bb ` / `cc ` 前缀消息转给对应插件，改它需要重启 daemon。
+
+`paseo-bb-queue` 和 `paseo-cc-queue` 共用 `plugin/server/agent-tree.ts` 和 `plugin/client/frontend-queue-bridge.ts`，两份必须保持一致，改一边要同步另一边。

@@ -225,6 +225,13 @@ export class QueueStore {
     return item;
   }
 
+  /** The item the next dispatch would send, without removing it. */
+  peekReady(agentId: string): StoredQueuedItem | null {
+    const record = this.queues.get(agentId);
+    if (!record || record.paused) return null;
+    return record.items[0] ?? null;
+  }
+
   shiftReady(agentId: string): StoredQueuedItem | null {
     const record = this.queues.get(agentId);
     if (!record || record.paused || record.items.length === 0) {
