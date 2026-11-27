@@ -1,0 +1,12 @@
+{
+  "name": "paseo-bb-queue",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Daemon-side persistent message queue for Paseo, triggered by a 'bb ' prefix or /bb.",
+  "license": "MIT",
+  "repository": "https://github.com/mjscjj/paseo-bb-queue",
+  "scripts": {
+    "test": "node --import ./test/host-deps-loader.mjs --experimental-strip-types --test test/*.test.mjs"
+  }
+}

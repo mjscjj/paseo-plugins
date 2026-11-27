@@ -5,7 +5,9 @@ import { realpathSync } from "node:fs";
 const paseoBin = realpathSync(
   spawnSync("which", ["paseo"], { encoding: "utf8" }).stdout.trim(),
 );
-const statusRaw = spawnSync(paseoBin, ["status", "--json"], {
+// Checks the daemon of PASEO_HOME (default ~/.paseo).
+const homeArgs = process.env.PASEO_HOME ? ["--home", process.env.PASEO_HOME] : [];
+const statusRaw = spawnSync(paseoBin, [...homeArgs, "status", "--json"], {
   encoding: "utf8",
   env: { ...process.env, NODE_OPTIONS: "" },
 });
