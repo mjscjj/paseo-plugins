@@ -39,7 +39,8 @@ fi
 # The shim is still loaded in the running daemon; restart it before deleting the code.
 case "$RESTART" in
   no)
-    log "Restart the Paseo daemon, then delete $DIR"
+    if [ "$DELETE_CODE" = "true" ]; then log "Restart the Paseo daemon to unload the shim"
+    else log "Restart the Paseo daemon, then delete $DIR"; fi
     ;;
   now|idle)
     WAIT_FLAG=$([ "$RESTART" = "now" ] && echo "--now" || echo "--when-idle")
@@ -52,6 +53,7 @@ case "$RESTART" in
     else
       nohup setsid bash -c "$CLEANUP" >/dev/null 2>&1 < /dev/null &
     fi
-    log "Daemon restart scheduled; $DIR is deleted after it."
+    if [ "$DELETE_CODE" = "true" ]; then log "Daemon restart scheduled."
+    else log "Daemon restart scheduled; $DIR is deleted after it."; fi
     ;;
 esac

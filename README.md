@@ -25,4 +25,6 @@ for p in paseo-bb-queue/plugin paseo-auto-retry paseo-unread-count; do paseo plu
 
 `git -C ~/.local/lib pull`，然后 `paseo plugin reload <插件 ID>`（不需要重启 daemon）。
 
+从带 cc-queue 的旧版升级：先 `paseo plugin remove cc-queue`（旧的 cc 待发消息和间隔设置不迁移），pull 后 reload bb-queue，再重启 daemon（shim 有改动）。
+
 例外：`paseo-bb-queue/shim/` 由 drop-in 注入 daemon 进程，负责把 `bb ` / `cc ` 前缀消息转给 bb-queue 插件，改它需要重启 daemon（`paseo-bb-queue/scripts/restart-when-idle.sh`）。

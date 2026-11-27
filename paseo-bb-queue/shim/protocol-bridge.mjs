@@ -37,7 +37,8 @@ export function isPluginConfigured(pluginId) {
       const config = JSON.parse(readFileSync(configPath, "utf8"));
       configCache = {
         mtimeMs,
-        plugins: config.pluginsEnabled === false ? {} : (config.plugins ?? {}),
+        // Paseo runs plugins only when pluginsEnabled is true (missing means off).
+        plugins: config.pluginsEnabled === true ? (config.plugins ?? {}) : {},
       };
     }
   } catch {
