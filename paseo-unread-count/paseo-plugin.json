@@ -1,0 +1,9 @@
+{
+  "id": "unread-count",
+  "name": "未看会话计数",
+  "description": "在侧边栏顶部显示所有已连接主机上已完成、出错或等待审批但还没看的会话数量，点开可跳转。",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.17.0"
+  }
+}

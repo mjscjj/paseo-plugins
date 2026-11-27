@@ -1,0 +1,9 @@
+{
+  "id": "cc-queue",
+  "name": "CC Timed Queue",
+  "description": "Timed message queue triggered by 'cc ' prefix or /cc: each message is sent a configurable number of minutes after the previous one.",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.11.0"
+  }
+}

@@ -1,0 +1,12 @@
+# 仓库根是 ~/.local/lib；只收 Paseo 插件，其他目录一律忽略。
+/*
+!/.gitignore
+!/README.md
+!/paseo-bb-queue/
+!/paseo-auto-retry/
+!/paseo-cc-queue/
+!/paseo-unread-count/
+
+node_modules/
+# macOS 拷贝带来的 AppleDouble 元数据
+._*

@@ -1,0 +1,9 @@
+{
+  "id": "auto-retry",
+  "name": "Auto Retry",
+  "description": "Automatically retries agent turns interrupted by transient timeout, network, rate-limit, or provider errors.",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.14.0"
+  }
+}

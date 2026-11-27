@@ -1,0 +1,15 @@
+{
+  "name": "paseo-auto-retry",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "files": [
+    "paseo-plugin.json",
+    "index.server.ts",
+    "server/",
+    "shared/"
+  ],
+  "scripts": {
+    "test": "node --test test/auto-retry.test.mjs"
+  }
+}
