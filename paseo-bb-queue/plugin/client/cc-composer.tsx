@@ -12,9 +12,9 @@ import {
   ingestRpc,
   listQueueSummariesRpc,
   setFrontendQueueHoldRpc,
-} from "../shared/contracts.ts";
+} from "../shared/cc-contracts.ts";
 import { registerFrontendQueueBridgeOwner } from "./frontend-queue-bridge.ts";
-import { QueueManagerView } from "./queue-manager.tsx";
+import { QueueManagerView } from "./cc-queue-manager.tsx";
 import { formatDue } from "./time-format.ts";
 
 const SUMMARY_POLL_MS = 5_000;
@@ -97,6 +97,11 @@ function formatSheetTitle(summary: AgentQueueSummary | undefined): string {
   return summary.paused
     ? `CC 定时队列 · 已暂停 (${summary.count})`
     : `CC 定时队列 (${summary.count})`;
+}
+
+interface ComposerLike {
+  readonly prompt: string;
+  setPrompt(text: string): void;
 }
 
 export function contributeQueueComposer(
@@ -267,6 +272,16 @@ export function contributeQueueComposer(
     },
     reportError(message) {
       errorReporter.report(message);
+    },
+    restore(agentId, text) {
+      // composers() exists from Paseo 0.17; older hosts fall back to showing the text.
+      const composers = (
+        client as { composers?: (selector: { agentId: string }) => readonly ComposerLike[] }
+      ).composers;
+      const composer = typeof composers === "function" ? composers({ agentId })[0] : undefined;
+      if (!composer) return false;
+      composer.setPrompt(composer.prompt.trim() ? `${composer.prompt}\n${text}` : text);
+      return true;
     },
   });
 

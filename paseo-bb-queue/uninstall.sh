@@ -16,6 +16,13 @@ pz() { paseo --home "$PASEO_HOME" "$@"; }
 
 log() { printf '[bb-queue] %s\n' "$*"; }
 
+# Inside a paseo-plugins checkout the code is tracked by that repo: leave it in place.
+DELETE_CODE="rm -rf '$DIR'"
+if [ ! -d "$DIR/.git" ] && git -C "$(dirname "$DIR")" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  log "$DIR belongs to a git checkout; the code stays, only the plugin and the daemon hook are removed."
+  DELETE_CODE="true"
+fi
+
 if pz plugin ls bb-queue >/dev/null 2>&1; then
   log "Removing plugin bb-queue"
   pz plugin remove bb-queue >/dev/null
@@ -38,7 +45,7 @@ case "$RESTART" in
     WAIT_FLAG=$([ "$RESTART" = "now" ] && echo "--now" || echo "--when-idle")
     RUNNER="$(mktemp "${TMPDIR:-/tmp}/bb-queue-uninstall.XXXXXX")"
     cp "$DIR/scripts/restart-when-idle.sh" "$RUNNER"
-    CLEANUP="bash '$RUNNER' $WAIT_FLAG $MODE '' && rm -rf '$DIR' '$RUNNER'"
+    CLEANUP="bash '$RUNNER' $WAIT_FLAG $MODE '' && $DELETE_CODE && rm -f '$RUNNER'"
     if [ "$MODE" = "systemd" ] && command -v systemd-run >/dev/null; then
       systemd-run --user --quiet --collect --unit="paseo-bb-queue-uninstall-$(date +%s)" \
         --setenv=PASEO_HOME="$PASEO_HOME" --setenv=PATH="$PATH" bash -c "$CLEANUP" >/dev/null

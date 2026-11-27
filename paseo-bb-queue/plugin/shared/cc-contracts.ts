@@ -1,19 +1,16 @@
 import { defineRpc, defineSettings } from "@getpaseo/plugin";
 import { z } from "zod";
 
-export const CC_PLUGIN_ID = "cc-queue";
 export const CC_PREFIX = "cc ";
 export const CC_PREFIX_REGEX = /^\s*cc[^\S\r\n]+/i;
 export const CC_INGEST_METHOD = "cc.ingest";
-/** The shared frontend bridge falls back to this for owners without `matches`. */
-export const BB_PREFIX_REGEX = /^\s*bb[^\S\r\n]+/i;
 
 export const DEFAULT_INTERVAL_MINUTES = 30;
 export const MAX_INTERVAL_MINUTES = 24 * 60;
 export const DEFAULT_MAX_SUBAGENT_WAIT_MINUTES = 60;
 
 export const timingSettings = defineSettings({
-  id: "timing",
+  id: "cc-timing",
   scope: "host",
   version: 1,
   schema: z.object({
@@ -101,7 +98,7 @@ export const ingestRpc = defineRpc({
 });
 
 export const listQueueSummariesRpc = defineRpc({
-  name: "queue.summaries",
+  name: "cc.queue.summaries",
   input: z.object({}),
   output: z.object({
     summaries: z.array(AgentQueueSummarySchema),
@@ -109,25 +106,25 @@ export const listQueueSummariesRpc = defineRpc({
 });
 
 export const getAgentQueueRpc = defineRpc({
-  name: "queue.get",
+  name: "cc.queue.get",
   input: z.object({ agentId: z.string().min(1) }),
   output: AgentQueueDetailSchema,
 });
 
 export const enqueueManualRpc = defineRpc({
-  name: "queue.enqueue",
+  name: "cc.queue.enqueue",
   input: z.object({ agentId: z.string().min(1), text: z.string() }),
   output: AgentQueueDetailSchema,
 });
 
 export const updateQueueItemRpc = defineRpc({
-  name: "queue.update",
+  name: "cc.queue.update",
   input: z.object({ agentId: z.string().min(1), itemId: z.string().min(1), text: z.string() }),
   output: AgentQueueDetailSchema,
 });
 
 export const sendQueueItemNowRpc = defineRpc({
-  name: "queue.send_now",
+  name: "cc.queue.send_now",
   input: z.object({
     agentId: z.string().min(1),
     itemId: z.string().min(1),
@@ -137,25 +134,25 @@ export const sendQueueItemNowRpc = defineRpc({
 });
 
 export const removeQueueItemRpc = defineRpc({
-  name: "queue.remove",
+  name: "cc.queue.remove",
   input: z.object({ agentId: z.string().min(1), itemId: z.string().min(1) }),
   output: AgentQueueDetailSchema,
 });
 
 export const setQueuePausedRpc = defineRpc({
-  name: "queue.set_paused",
+  name: "cc.queue.set_paused",
   input: z.object({ agentId: z.string().min(1), paused: z.boolean() }),
   output: AgentQueueDetailSchema,
 });
 
 export const clearQueueRpc = defineRpc({
-  name: "queue.clear",
+  name: "cc.queue.clear",
   input: z.object({ agentId: z.string().min(1) }),
   output: AgentQueueDetailSchema,
 });
 
 export const setFrontendQueueHoldRpc = defineRpc({
-  name: "queue.frontend_hold",
+  name: "cc.queue.frontend_hold",
   input: z.object({ agentId: z.string().min(1), hasFrontendItems: z.boolean() }),
   output: z.object({ ok: z.boolean() }),
 });

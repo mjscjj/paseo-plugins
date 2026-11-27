@@ -18,6 +18,7 @@ import {
   waitSettings,
 } from "./shared/contracts.ts";
 import { ProviderSubagentTracker } from "./server/agent-tree.ts";
+import { contributeTimedQueue } from "./server/cc-contribute.ts";
 import { createPaseoAgentPort, QueueScheduler } from "./server/scheduler.ts";
 import { QueueStore, stripBbPrefix, stripOptionalBbPrefix } from "./server/store.ts";
 
@@ -42,10 +43,18 @@ export default function contribute(server: PluginServerContext) {
   });
   const removeSettingsListener = settings.subscribe(applySettings);
 
+  // One per-agent send lock for both queues, so a cc message never cuts into a bb send.
+  const inFlight = new Set<string>();
   const scheduler = new QueueScheduler(store, {
     maxTreeWaitMs: () => maxSubagentWaitMinutes * 60_000,
+    inFlight,
   });
   const tracker = new ProviderSubagentTracker();
+  const removeTimedQueue = contributeTimedQueue(server, {
+    inFlight,
+    bbHasReady: (agentId) => store.hasReadyItems(agentId),
+    tracker,
+  });
   let lastReconcileAt = 0;
   // Paseo hands the plugin its API only inside handlers and events; it is the same object for
   // the plugin process lifetime, so keep it for the sweep timer.
@@ -194,6 +203,7 @@ export default function contribute(server: PluginServerContext) {
   });
 
   return () => {
+    removeTimedQueue();
     clearInterval(sweepTimer);
     removeSettingsListener();
     scheduler.dispose();

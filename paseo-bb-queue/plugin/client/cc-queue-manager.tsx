@@ -2,8 +2,8 @@ import type { PluginTheme } from "@getpaseo/plugin";
 import { Icon, ScrollView, TextInput } from "@getpaseo/plugin/client/react-native";
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import { CC_PREFIX_REGEX, type QueuedItemView } from "../shared/contracts.ts";
-import { useAgentQueue, useAgentQueueActions } from "./hooks.ts";
+import { CC_PREFIX_REGEX, type QueuedItemView } from "../shared/cc-contracts.ts";
+import { useAgentQueue, useAgentQueueActions } from "./cc-hooks.ts";
 import { formatCountdown, formatDue } from "./time-format.ts";
 
 export interface QueueManagerViewProps {

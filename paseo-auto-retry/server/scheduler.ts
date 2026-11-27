@@ -60,7 +60,8 @@ export interface TimelinePage {
 
 export interface RetryAgentPort {
   refresh(agentId: string): Promise<AgentSnapshot | null>;
-  refetchTimeline(agentId: string, limit: number): Promise<TimelinePage | null>;
+  /** The last whole turn, so its user message is there however many tool calls it made. */
+  refetchTimeline(agentId: string): Promise<TimelinePage | null>;
   send(agentId: string, text: string, options: { messageId: string }): Promise<void>;
 }
 
@@ -112,16 +113,16 @@ export function isAgentInScope(
   });
 }
 
+// Only what means "something else happened to the agent". Opening the agent clears its unread
+// attention and bumps updatedAt; that must not cancel a scheduled retry.
 function snapshotKey(a: AgentSnapshot): string {
   return JSON.stringify([
     a.status,
-    a.updatedAt ?? null,
     a.lastUserMessageAt ?? null,
     a.lastError ?? null,
     a.archivedAt ?? null,
     a.activeTurn ?? null,
     a.pendingPermissions?.length ?? 0,
-    a.attentionReason ?? null,
   ]);
 }
 
@@ -135,10 +136,18 @@ function extractUserMessageText(entry: TimelineEntry): string | null {
   return null;
 }
 
+interface PromptIdentity {
+  key: string;
+  text: string;
+  timestamp: number;
+  /** No user message in the timeline read; identified by agent.lastUserMessageAt only. */
+  fromLastUserAt?: boolean;
+}
+
 function extractLatestPromptIdentity(
   agent: AgentSnapshot,
   entries: TimelineEntry[],
-): { key: string; text: string; timestamp: number } | null {
+): PromptIdentity | null {
   for (let i = entries.length - 1; i >= 0; i -= 1) {
     const text = extractUserMessageText(entries[i]);
     if (text !== null) {
@@ -157,6 +166,7 @@ function extractLatestPromptIdentity(
       key: sha256(JSON.stringify(["lastUserMessageAt", lastUserAt])),
       text: "",
       timestamp: lastUserAt,
+      fromLastUserAt: true,
     };
   }
   return null;
@@ -185,6 +195,10 @@ export function detectIssue(
     text = outcome.error.code
       ? `${outcome.error.code}: ${outcome.error.message}`
       : outcome.error.message;
+    // Paseo writes the provider diagnostic (e.g. Claude's stderr) only into this timeline line.
+    const systemError =
+      tail?.item?.type === "assistant_message" ? (tail.item.text ?? "").trim() : "";
+    if (systemError.startsWith("[System Error]")) text = `${text}\n${systemError}`;
     at = toMillis(agent.attentionTimestamp ?? agent.updatedAt) || now;
     source = "turn-failed";
   } else if (agent.lastError) {
@@ -338,7 +352,7 @@ export class AutoRetryScheduler {
     const config = this.store.readConfig();
     if (!config.enabled) return "disabled";
 
-    const page = await port.refetchTimeline(agentId, 30);
+    const page = await port.refetchTimeline(agentId);
     const agent = page?.agent ?? (await port.refresh(agentId));
     if (!agent) return "missing-agent";
 
@@ -380,7 +394,17 @@ export class AutoRetryScheduler {
 
     let incident = state.agents[agent.id];
     const isAutoPrompt = prompt.text.startsWith(MARKER);
-    if (isAutoPrompt) {
+    // Without the prompt text, a lastUserMessageAt right at our last attempt is our own retry
+    // prompt: keep counting against the same budget instead of opening a fresh incident.
+    const attemptAt = Date.parse(incident?.lastAttemptAt ?? "");
+    const isOwnRetryByTime =
+      Boolean(prompt.fromLastUserAt) &&
+      Number.isFinite(attemptAt) &&
+      prompt.timestamp >= attemptAt - 1_000 &&
+      prompt.timestamp <= attemptAt + 120_000;
+    if (isOwnRetryByTime) {
+      // Same incident; fall through to the budget check below.
+    } else if (isAutoPrompt) {
       // Fail closed if state was lost: never let an auto-retry prompt grant a fresh budget.
       if (
         !incident?.messageIds.some((id) =>

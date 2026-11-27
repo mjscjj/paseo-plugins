@@ -7,6 +7,8 @@ import type { PluginAgentSnapshot, PluginWorkspaceSnapshot } from "@getpaseo/plu
  * - 等审批：Paseo 不给权限请求设 requiresAttention，而是让工作区状态变成 needs_input；
  *   同一工作区里的子 agent 不会把工作区拉成 needs_input，所以按工作区统计。
  * - 子 agent、后台 helper、子 agent 开出来的工作区都不算。
+ * - 正在跑的 agent 不算完成/出错：Paseo 在 agent 自己开新一轮时会保留旧的“完成未看”标记，
+ *   这一轮若再申请权限，同一会话会在“等审批”和“已完成”里各算一次。
  * - 只算所在工作区还在、且没在归档中的会话。归档工作区时 App 只移除工作区，若漏收了
  *   agent 自己的归档更新，agent 会带着旧的“未看”标记留在本地，点进去才发现已归档；
  *   App 侧边栏按工作区显示所以看不到它，这里按同样口径排除。
@@ -17,7 +19,8 @@ export type UnreadKind = "permission" | "error" | "finished";
 type AgentFields = Pick<
   PluginAgentSnapshot,
   "background" | "parentAgentId" | "parentAgent" | "requiresAttention" | "attentionReason"
->;
+> &
+  Partial<Pick<PluginAgentSnapshot, "status">>;
 
 type WorkspaceFields = Pick<
   PluginWorkspaceSnapshot,
@@ -30,6 +33,9 @@ function isTopLevelAgent(agent: AgentFields): boolean {
 
 export function agentUnreadKind(agent: AgentFields): "finished" | "error" | null {
   if (!isTopLevelAgent(agent) || !agent.requiresAttention) return null;
+  // Paseo keeps the "finished" mark when the agent starts a turn on its own; while that turn runs
+  // (or waits for permission, which is counted per workspace) it is not an unread result.
+  if (agent.status === "running" || agent.status === "initializing") return null;
   if (agent.attentionReason === "finished") return "finished";
   if (agent.attentionReason === "error") return "error";
   return null;

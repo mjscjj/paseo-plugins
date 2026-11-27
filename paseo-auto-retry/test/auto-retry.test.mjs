@@ -340,3 +340,95 @@ test("fails closed on unknown auto-retry prompt after state loss and respects op
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a long failed retry turn without its prompt in view still counts against the same budget", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "auto-retry-storm-"));
+  try {
+    const store = new AutoRetryStore(dir);
+    let now = Date.parse("2026-11-27T10:00:00Z");
+    const timers = [];
+    const scheduler = new AutoRetryScheduler(store, {
+      now: () => now,
+      setTimer: (fn, ms) => {
+        timers.push({ fn, ms });
+        return timers.length;
+      },
+      clearTimer: () => {},
+    });
+    let lastUser = now - 60_000;
+    let failAt = now;
+    let seq = 100;
+    let sends = 0;
+    const agent = () => ({
+      id: "a1",
+      cwd: "/x",
+      status: "error",
+      updatedAt: new Date(failAt).toISOString(),
+      lastUserMessageAt: new Date(lastUser).toISOString(),
+      lastError: "stream disconnected before completion",
+      archivedAt: null,
+      activeTurn: null,
+      pendingPermissions: [],
+      attentionReason: "error",
+      attentionTimestamp: new Date(failAt).toISOString(),
+      labels: {},
+    });
+    // A host without wholeTurns: only tool calls and the error line, no user message.
+    const page = () => ({
+      agent: agent(),
+      epoch: "e",
+      hasNewer: false,
+      entries: [
+        { seqEnd: seq - 1, timestamp: new Date(now).toISOString(), item: { type: "tool_call" } },
+        {
+          seqEnd: seq,
+          timestamp: new Date(now).toISOString(),
+          item: { type: "assistant_message", text: "[System Error] stream disconnected before completion" },
+        },
+      ],
+    });
+    const port = {
+      refresh: async () => agent(),
+      refetchTimeline: async () => page(),
+      send: async () => {
+        sends += 1;
+        now += 1000;
+        lastUser = now;
+      },
+    };
+    for (let round = 0; round < 8; round += 1) {
+      now += 5 * 60_000;
+      seq += 40;
+      failAt = now;
+      await scheduler.inspectAndSchedule(port, "a1", {
+        kind: "failed",
+        error: { message: "stream disconnected before completion" },
+      });
+      const timer = timers.pop();
+      if (timer) {
+        now += timer.ms;
+        await timer.fn();
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
+    assert.equal(sends, 3, "stops at the configured number of retries");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("classifier: common transient errors, per-minute quotas, URLs and Retry-After", () => {
+  for (const text of ["TypeError: terminated", "other side closed", "error sending request for url"]) {
+    assert.equal(classifyError(text)?.category, "network", text);
+  }
+  assert.equal(
+    classifyError("Quota exceeded for quota metric 'Generate requests' per minute")?.retryable,
+    true,
+  );
+  assert.equal(classifyError("You exceeded your current quota, check your billing")?.retryable, false);
+  assert.equal(classifyError("socket hang up (https://login.example.com/oauth)")?.category, "network");
+  assert.equal(extractRetryAfterSeconds("retry after 30"), 30);
+  assert.equal(extractRetryAfterSeconds("retry after 3:45 PM"), 0);
+  assert.equal(extractRetryAfterSeconds("Retry-After: 86400"), 15 * 60);
+  assert.equal(extractRetryAfterSeconds("retry after 500ms"), 0);
+});

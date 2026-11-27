@@ -9,7 +9,7 @@ import {
   CC_PREFIX_REGEX,
   ImagePayloadSchema,
   type QueuedItemView,
-} from "../shared/contracts.ts";
+} from "../shared/cc-contracts.ts";
 
 const HISTORY_CAP = 100;
 
@@ -29,6 +29,8 @@ export type StoredQueuedItem = z.infer<typeof StoredQueuedItemSchema>;
 const StoredAgentQueueSchema = z.object({
   paused: z.boolean(),
   pauseReason: z.string().nullable(),
+  /** Paused by a failed turn: the next completed turn (e.g. an auto-retry) resumes it. */
+  resumeOnCompletedTurn: z.boolean().optional(),
   updatedAt: z.string().optional(),
   items: z.array(StoredQueuedItemSchema),
 });
@@ -41,6 +43,7 @@ const PersistedStoreSchema = z.object({
 interface AgentQueueRecord {
   paused: boolean;
   pauseReason: string | null;
+  resumeOnCompletedTurn?: boolean;
   updatedAt: string;
   items: StoredQueuedItem[];
 }
@@ -113,6 +116,16 @@ function formatPreview(item: StoredQueuedItem | undefined): string | null {
   return parts.length > 0 ? `(${parts.join(" · ")})` : "(空)";
 }
 
+/**
+ * Paseo keeps a receipt per messageId, including for sends that failed, so a retried send needs
+ * a fresh id or it is refused as already handled.
+ */
+function withFreshMessageId(item: StoredQueuedItem): StoredQueuedItem {
+  if (!item.messageId) return item;
+  const base = item.messageId.replace(/~r[0-9a-z]+$/, "");
+  return { ...item, messageId: `${base}~r${Date.now().toString(36)}` };
+}
+
 function isDue(item: StoredQueuedItem, nowMs: number): boolean {
   const due = Date.parse(item.dueAt);
   return Number.isNaN(due) || due <= nowMs;
@@ -142,6 +155,7 @@ export class QueueStore {
         this.queues.set(agentId, {
           paused: record.paused,
           pauseReason: record.pauseReason,
+          ...(record.resumeOnCompletedTurn ? { resumeOnCompletedTurn: true } : {}),
           updatedAt: record.updatedAt ?? record.items.at(-1)?.createdAt ?? now,
           items: [...record.items].sort((a, b) => a.dueAt.localeCompare(b.dueAt)),
         });
@@ -274,6 +288,16 @@ export class QueueStore {
     if (!this.hasDueItems(agentId, nowMs)) return null;
     const record = this.queues.get(agentId)!;
     const item = record.items.shift()!;
+    // Sent late (agent busy, daemon down): push the rest back by the same delay so the next one
+    // still comes an interval later instead of right after this one.
+    const headDue = Date.parse(item.dueAt);
+    const lateness = Number.isNaN(headDue) ? 0 : Math.max(0, nowMs - headDue);
+    if (lateness > 0) {
+      for (const rest of record.items) {
+        const due = Date.parse(rest.dueAt);
+        rest.dueAt = new Date((Number.isNaN(due) ? nowMs : due) + lateness).toISOString();
+      }
+    }
     record.updatedAt = new Date(nowMs).toISOString();
     this.pruneIfEmpty(agentId);
     this.persist();
@@ -293,6 +317,7 @@ export class QueueStore {
   }
 
   restoreItemAt(agentId: string, item: StoredQueuedItem, index: number): void {
+    item = withFreshMessageId(item);
     const record = this.getOrCreate(agentId);
     const clamped = Math.max(0, Math.min(index, record.items.length));
     record.items.splice(clamped, 0, item);
@@ -302,9 +327,10 @@ export class QueueStore {
 
   requeueFrontAndPause(agentId: string, item: StoredQueuedItem, reason: string): void {
     const record = this.getOrCreate(agentId);
-    record.items.unshift(item);
+    record.items.unshift(withFreshMessageId(item));
     record.paused = true;
     record.pauseReason = reason;
+    record.resumeOnCompletedTurn = false;
     record.updatedAt = new Date().toISOString();
     this.persist();
   }
@@ -323,6 +349,7 @@ export class QueueStore {
     const wasPaused = record.paused;
     record.paused = paused;
     record.pauseReason = paused ? (reason ?? "手动暂停") : null;
+    record.resumeOnCompletedTurn = false;
     if (wasPaused && !paused && record.items.length > 0) {
       const headDue = Date.parse(record.items[0].dueAt);
       const shift = Number.isNaN(headDue) ? 0 : Math.max(0, nowMs - headDue);
@@ -337,6 +364,24 @@ export class QueueStore {
     this.pruneIfEmpty(agentId);
     this.persist();
     return this.getDetail(agentId);
+  }
+
+  /** A failed turn holds the queue so it does not race auto-retry or pile onto a broken agent. */
+  pauseAfterFailedTurn(agentId: string, reason: string, nowMs: number = Date.now()): boolean {
+    const record = this.queues.get(agentId);
+    if (!record || record.items.length === 0 || record.paused) return false;
+    this.setPaused(agentId, true, reason, nowMs);
+    record.resumeOnCompletedTurn = true;
+    this.persist();
+    return true;
+  }
+
+  /** Resumes a queue that a failed turn paused, once a later turn completes. */
+  resumeAfterCompletedTurn(agentId: string, nowMs: number = Date.now()): boolean {
+    const record = this.queues.get(agentId);
+    if (!record?.paused || !record.resumeOnCompletedTurn) return false;
+    this.setPaused(agentId, false, null, nowMs);
+    return true;
   }
 
   updateItemText(agentId: string, itemId: string, nextText: string): AgentQueueDetail {

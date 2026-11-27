@@ -8,7 +8,7 @@ import {
 } from "@getpaseo/plugin/client/ui";
 import { useCallback, useMemo, useState } from "react";
 import { Text } from "react-native";
-import { MAX_INTERVAL_MINUTES, timingSettings } from "../shared/contracts.ts";
+import { MAX_INTERVAL_MINUTES, timingSettings } from "../shared/cc-contracts.ts";
 
 type ReadySettings = Extract<SettingsState<typeof timingSettings.schema>, { status: "ready" }>;
 type MinutesKey = "intervalMinutes" | "maxSubagentWaitMinutes";

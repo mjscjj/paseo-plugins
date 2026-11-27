@@ -25,6 +25,8 @@ export interface QueueSchedulerOptions {
   /** Longest one message waits for busy subagents once the root is idle; 0 = no limit. */
   maxTreeWaitMs?: () => number;
   now?: () => number;
+  /** Agents with a send in progress, shared with the cc timed queue so the two never overlap. */
+  inFlight?: Set<string>;
 }
 
 const DEFAULT_MAX_TREE_WAIT_MS = 60 * 60_000;
@@ -112,7 +114,7 @@ function toSendOptions(
 
 export class QueueScheduler {
   private readonly store: QueueStore;
-  private readonly inFlight = new Set<string>();
+  private readonly inFlight: Set<string>;
   private readonly frontendHolds = new Map<string, number>();
   private readonly pendingDrainTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly waitingReasons = new Map<string, string>();
@@ -123,6 +125,7 @@ export class QueueScheduler {
 
   constructor(store: QueueStore, options: QueueSchedulerOptions = {}) {
     this.store = store;
+    this.inFlight = options.inFlight ?? new Set();
     this.turnEndGraceMs = options.turnEndGraceMs ?? DEFAULT_TURN_END_GRACE_MS;
     this.frontendHoldMaxWaitMs =
       options.frontendHoldMaxWaitMs ?? DEFAULT_FRONTEND_HOLD_MAX_WAIT_MS;
@@ -311,13 +314,15 @@ export class QueueScheduler {
   ): Promise<void> {
     this.clearPendingDrainTimer(agentId);
     if (outcome.kind === "failed") {
-      this.store.pauseIfNonEmpty(agentId, `上一轮执行失败: ${outcome.error.message}`);
+      // Resumes by itself if a later turn (an auto-retry, or the user) completes.
+      this.store.pauseIfNonEmpty(agentId, `上一轮执行失败: ${outcome.error.message}`, true);
       return;
     }
     if (outcome.kind === "canceled") {
       this.store.pauseIfNonEmpty(agentId, `上一轮已取消 (${outcome.reason})`);
       return;
     }
+    this.store.resumeAfterCompletedTurn(agentId);
     if (!this.store.hasReadyItems(agentId)) {
       return;
     }

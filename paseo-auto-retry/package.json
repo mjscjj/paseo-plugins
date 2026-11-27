@@ -10,6 +10,6 @@
     "shared/"
   ],
   "scripts": {
-    "test": "node --test test/auto-retry.test.mjs"
+    "test": "node --experimental-strip-types --test test/auto-retry.test.mjs"
   }
 }

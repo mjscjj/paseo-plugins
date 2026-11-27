@@ -14,8 +14,12 @@ function createPaseoRetryPort(paseo: PluginHandlerContext["paseo"]): RetryAgentP
       const refreshed = await paseo.agents.ref(agentId).refresh();
       return (refreshed?.agent as AgentSnapshot | undefined) ?? null;
     },
-    async refetchTimeline(agentId: string, limit: number): Promise<TimelinePage | null> {
-      const page = await paseo.agents.ref(agentId).timeline.refetch({ limit });
+    async refetchTimeline(agentId: string): Promise<TimelinePage | null> {
+      const page = await paseo.agents.ref(agentId).timeline.refetch({
+        direction: "tail",
+        limit: 1,
+        wholeTurns: true,
+      } as Parameters<ReturnType<PluginHandlerContext["paseo"]["agents"]["ref"]>["timeline"]["refetch"]>[0]);
       return (page as unknown as TimelinePage) ?? null;
     },
     async send(

@@ -156,6 +156,18 @@ test("real Paseo daemon E2E: supervisor -> worker -> register.mjs -> bb-queue pl
         /Agent not found/i,
       );
 
+      // 3b. "cc " goes to the timed queue inside the same plugin
+      await assert.rejects(
+        () => client.sendAgentMessage("nonexistent-agent", "cc    ", { messageId: "msg_e2e_cc_empty" }),
+        /cc 定时消息内容不能为空/,
+      );
+      await assert.rejects(
+        () => client.sendAgentMessage("nonexistent-agent", "cc 半小时后跑测试", { messageId: "msg_e2e_cc" }),
+        /Agent 不存在/,
+      );
+      assert.deepEqual(await client.invokePluginRpc("bb-queue", "cc.queue.summaries", {}), {
+        summaries: [],
+      });
       // 4. Frontend plugin RPCs (summaries & detail) work end-to-end
       const summaries = await client.invokePluginRpc("bb-queue", "queue.summaries", {});
       assert.deepEqual(summaries, { summaries: [] });

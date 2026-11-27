@@ -2,7 +2,6 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin/server";
 import {
-  CC_PLUGIN_ID,
   clearQueueRpc,
   DEFAULT_INTERVAL_MINUTES,
   DEFAULT_MAX_SUBAGENT_WAIT_MINUTES,
@@ -16,14 +15,14 @@ import {
   setQueuePausedRpc,
   timingSettings,
   updateQueueItemRpc,
-} from "./shared/contracts.ts";
-import { ProviderSubagentTracker } from "./server/agent-tree.ts";
+} from "../shared/cc-contracts.ts";
+import { ProviderSubagentTracker } from "./agent-tree.ts";
 import {
-  createBbQueueFilePeek,
+  type BbQueuePeek,
   createPaseoAgentPort,
   TimedQueueScheduler,
-} from "./server/scheduler.ts";
-import { QueueStore, stripCcPrefix, stripOptionalCcPrefix } from "./server/store.ts";
+} from "./cc-scheduler.ts";
+import { QueueStore, stripCcPrefix, stripOptionalCcPrefix } from "./cc-store.ts";
 
 /** Due messages are picked up within this long. */
 const SWEEP_INTERVAL_MS = 5_000;
@@ -32,15 +31,25 @@ function paseoHome(): string {
   return process.env.PASEO_HOME ?? path.join(homedir(), ".paseo");
 }
 
-export default function contribute(server: PluginServerContext) {
-  const store = new QueueStore(path.join(paseoHome(), "plugin-data", CC_PLUGIN_ID, "queues.json"));
+export interface TimedQueueDeps {
+  /** Shared with the bb queue: an agent with a send in progress gets nothing else. */
+  inFlight: Set<string>;
+  /** Whether the bb queue has a message ready for this agent; bb goes first. */
+  bbHasReady: BbQueuePeek;
+  tracker: ProviderSubagentTracker;
+}
+
+/** The "cc " timed queue, run inside the bb-queue plugin. */
+export function contributeTimedQueue(server: PluginServerContext, deps: TimedQueueDeps) {
+  const store = new QueueStore(path.join(paseoHome(), "plugin-data", "bb-queue", "cc-queues.json"));
   let intervalMinutes = DEFAULT_INTERVAL_MINUTES;
   let maxSubagentWaitMinutes = DEFAULT_MAX_SUBAGENT_WAIT_MINUTES;
   const scheduler = new TimedQueueScheduler(store, {
-    bbQueuePeek: createBbQueueFilePeek(path.join(paseoHome(), "plugin-data", "bb-queue", "queues.json")),
+    bbQueuePeek: deps.bbHasReady,
+    inFlight: deps.inFlight,
     maxTreeWaitMs: () => maxSubagentWaitMinutes * 60_000,
   });
-  const tracker = new ProviderSubagentTracker();
+  const { tracker } = deps;
   const settings = server.registerSettings(timingSettings);
   // Paseo hands the plugin its API only inside handlers and events; it is the same object for
   // the plugin process lifetime, so keep it for the sweep timer.
@@ -161,8 +170,13 @@ export default function contribute(server: PluginServerContext) {
     portFor(paseo);
   });
 
-  server.on("agent.turn_ended", (_event, { paseo }) => {
+  server.on("agent.turn_ended", ({ agent, outcome }, { paseo }) => {
     portFor(paseo);
+    if (outcome?.kind === "failed") {
+      store.pauseAfterFailedTurn(agent.id, `上一轮执行失败: ${outcome.error.message}`);
+    } else if (outcome?.kind === "completed") {
+      store.resumeAfterCompletedTurn(agent.id);
+    }
     runSweep();
   });
 
@@ -179,6 +193,5 @@ export default function contribute(server: PluginServerContext) {
     clearInterval(sweepTimer);
     removeSettingsListener();
     scheduler.dispose();
-    tracker.dispose();
   };
 }

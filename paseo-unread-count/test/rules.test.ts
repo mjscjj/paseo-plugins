@@ -99,3 +99,15 @@ test("排序：新的在前，坏时间和空值排最后且不产生 NaN", () =
   assert.deepEqual(sorted.slice(0, 2), ["2026-11-27T12:00:00Z", "2026-11-27T10:00:00Z"]);
   for (const a of items) for (const b of items) assert.ok(!Number.isNaN(newestFirst(a, b)));
 });
+
+test("a running agent with a stale finished mark is not counted as finished", () => {
+  const base = {
+    background: false,
+    parentAgentId: null,
+    parentAgent: null,
+    requiresAttention: true,
+    attentionReason: "finished" as const,
+  };
+  assert.equal(agentUnreadKind({ ...base, status: "running" }), null);
+  assert.equal(agentUnreadKind({ ...base, status: "idle" }), "finished");
+});

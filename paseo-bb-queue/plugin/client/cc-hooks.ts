@@ -13,7 +13,7 @@ import {
   sendQueueItemNowRpc,
   setQueuePausedRpc,
   updateQueueItemRpc,
-} from "../shared/contracts.ts";
+} from "../shared/cc-contracts.ts";
 
 export const QUEUE_SUMMARIES_KEY = ["cc-queue", "summaries"] as const;
 

@@ -30,6 +30,8 @@ export interface FrontendQueueOwner {
   ingest(payload: ConvertedIngestPayload): Promise<void>;
   setFrontendHold(agentId: string, hasFrontendItems: boolean): void;
   reportError(message: string): void;
+  /** Puts a message the backend could not take back into the agent's input box. */
+  restore?(agentId: string, text: string): boolean;
 }
 
 const BASE64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -38,6 +40,7 @@ const BASE64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012345
 const BRIDGE_GLOBAL_KEY = "__PASEO_PREFIX_QUEUE_FRONTEND_BRIDGE_V2__";
 const SEEN_IDS_CAP = 256;
 const HOLD_HEARTBEAT_MS = 25_000;
+const INGEST_RETRY_DELAY_MS = 1_500;
 
 export function uint8ArrayToBase64(bytes: Uint8Array): string {
   let out = "";
@@ -431,17 +434,32 @@ export function createScopedQueueMapInterceptor(options?: {
     const conversionPromise = convertComposerAttachmentsForIngest(item.attachments, encodeImage);
     queueMicrotask(() => {
       void conversionPromise
-        .then(({ images, attachments }) =>
-          owner.ingest({
+        .then(async ({ images, attachments }) => {
+          const payload: ConvertedIngestPayload = {
             agentId,
             text: item.text,
             messageId: item.id,
             ...(images.length > 0 ? { images } : {}),
             ...(attachments.length > 0 ? { attachments } : {}),
-          }),
-        )
+          };
+          try {
+            await owner.ingest(payload);
+          } catch {
+            // One retry covers a dropped connection; a second failure is reported below.
+            await new Promise((resolve) => setTimeout(resolve, INGEST_RETRY_DELAY_MS));
+            await owner.ingest(payload);
+          }
+        })
         .catch((err) => {
-          owner.reportError(err instanceof Error ? err.message : String(err));
+          // The message already left the native queue; hand the text back instead of losing it.
+          const message = err instanceof Error ? err.message : String(err);
+          let restored = false;
+          try {
+            restored = owner.restore?.(agentId, item.text) ?? false;
+          } catch {
+            restored = false;
+          }
+          owner.reportError(restored ? `${message}（内容已放回输入框）` : `${message}\n\n未能入队的内容：\n${item.text}`);
         });
     });
   }

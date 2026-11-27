@@ -99,6 +99,11 @@ function formatSheetTitle(summary: AgentQueueSummary | undefined): string {
     : `BB 服务端队列 (${summary.count})`;
 }
 
+interface ComposerLike {
+  readonly prompt: string;
+  setPrompt(text: string): void;
+}
+
 export function contributeQueueComposer(
   client: PluginClientContext,
   errorReporter: ClientErrorReporter,
@@ -264,6 +269,16 @@ export function contributeQueueComposer(
     },
     reportError(message) {
       errorReporter.report(message);
+    },
+    restore(agentId, text) {
+      // composers() exists from Paseo 0.17; older hosts fall back to showing the text.
+      const composers = (
+        client as { composers?: (selector: { agentId: string }) => readonly ComposerLike[] }
+      ).composers;
+      const composer = typeof composers === "function" ? composers({ agentId })[0] : undefined;
+      if (!composer) return false;
+      composer.setPrompt(composer.prompt.trim() ? `${composer.prompt}\n${text}` : text);
+      return true;
     },
   });
 

@@ -1,6 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
-import type { ActiveSendBehavior, AgentQueueDetail } from "../shared/contracts.ts";
+import type { ActiveSendBehavior, AgentQueueDetail } from "../shared/cc-contracts.ts";
 import {
   inspectAgentTree,
   type ProviderSubagentTracker,
@@ -13,7 +12,7 @@ import {
   type EnqueuePayload,
   type QueueStore,
   type StoredQueuedItem,
-} from "./store.ts";
+} from "./cc-store.ts";
 
 const DEFAULT_FRONTEND_HOLD_TTL_MS = 60_000;
 
@@ -61,22 +60,6 @@ export function createPaseoAgentPort(
 /** True when the bb queue has a message ready for this agent; cc lets bb go first. */
 export type BbQueuePeek = (agentId: string) => boolean;
 
-/** Reads bb-queue's persisted queue file. Missing or unreadable file means nothing pending. */
-export function createBbQueueFilePeek(filePath: string): BbQueuePeek {
-  return (agentId: string) => {
-    try {
-      if (!existsSync(filePath)) return false;
-      const parsed = JSON.parse(readFileSync(filePath, "utf8")) as {
-        queues?: Record<string, { paused?: boolean; items?: unknown[] }>;
-      };
-      const queue = parsed.queues?.[agentId];
-      return Boolean(queue && !queue.paused && (queue.items?.length ?? 0) > 0);
-    } catch {
-      return false;
-    }
-  };
-}
-
 // "closed" is an agent whose runtime is not loaded (sending resumes it); "error" is one whose
 // last turn failed. Both accept a new prompt exactly like "idle".
 const RESTING_STATUSES = new Set<string>(["idle", "closed", "error"]);
@@ -102,6 +85,8 @@ export interface TimedSchedulerOptions {
   frontendHoldTtlMs?: number;
   now?: () => number;
   bbQueuePeek?: BbQueuePeek;
+  /** Agents with a send in progress, shared with the bb queue so the two never overlap. */
+  inFlight?: Set<string>;
   /** Longest a due message waits for busy subagents once the root is idle; 0 = no limit. */
   maxTreeWaitMs?: () => number;
 }
@@ -114,7 +99,7 @@ const DEFAULT_MAX_TREE_WAIT_MS = 60 * 60_000;
  */
 export class TimedQueueScheduler {
   private readonly store: QueueStore;
-  private readonly inFlight = new Set<string>();
+  private readonly inFlight: Set<string>;
   private readonly frontendHolds = new Map<string, number>();
   private readonly waitingReasons = new Map<string, string>();
   private readonly frontendHoldTtlMs: number;
@@ -124,6 +109,7 @@ export class TimedQueueScheduler {
 
   constructor(store: QueueStore, options: TimedSchedulerOptions = {}) {
     this.store = store;
+    this.inFlight = options.inFlight ?? new Set();
     this.frontendHoldTtlMs = options.frontendHoldTtlMs ?? DEFAULT_FRONTEND_HOLD_TTL_MS;
     this.now = options.now ?? Date.now;
     this.bbQueuePeek = options.bbQueuePeek ?? (() => false);

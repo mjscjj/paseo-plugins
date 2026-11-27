@@ -17,7 +17,7 @@ import { QueueScheduler } from "../plugin/server/scheduler.ts";
 import { QueueStore, stripBbPrefix, stripOptionalBbPrefix } from "../plugin/server/store.ts";
 
 test("protocol-bridge: passes through non-bb and agent-originated messages untouched", () => {
-  const bridge = createConnectionBridge();
+  const bridge = createConnectionBridge({ isPluginAvailable: () => true });
 
   assert.equal(bridge.transformInboundText('{"type":"ping"}'), null);
   assert.equal(
@@ -104,7 +104,7 @@ test("protocol-bridge: passes through non-bb and agent-originated messages untou
 });
 
 test("protocol-bridge: rewrites 'bb ' inbound to plugin.rpc.invoke.request and maps response/error back", () => {
-  const bridge = createConnectionBridge();
+  const bridge = createConnectionBridge({ isPluginAvailable: () => true });
 
   const inbound = JSON.stringify({
     type: "session",
@@ -361,7 +361,10 @@ test("QueueStore & QueueScheduler: FIFO persistence, idle immediate send, permis
       "steer",
     );
     assert.deepEqual(afterSendNow.items.map((i) => i.text), ["step A"]);
-    assert.equal(afterSendNow.dispatchedTexts.mB, "step B edited");
+    // The failed send left a receipt for "mB" in Paseo, so the retry goes out under a fresh id.
+    const retriedId = sent.at(-1).options.messageId;
+    assert.match(retriedId, /^mB~r[0-9a-z]+$/);
+    assert.equal(afterSendNow.dispatchedTexts[retriedId], "step B edited");
     assert.equal(sent.at(-1).text, "step B edited");
     assert.equal(sent.at(-1).options.activeTurnBehavior, "steer");
 
@@ -790,5 +793,47 @@ test("frontend-queue-bridge: keeps normal frontend queue items in Map while prom
     assert.equal(converted.attachments[1].type, "forge_change_request");
   } finally {
     unregister();
+  }
+});
+
+test("QueueScheduler: a failed turn pauses, a later completed turn (auto-retry) resumes; manual pause stays", async () => {
+  const tmpDir = mkdtempSync(path.join(tmpdir(), "bb-queue-resume-"));
+  try {
+    const store = new QueueStore(path.join(tmpDir, "queues.json"));
+    const scheduler = new QueueScheduler(store, { turnEndGraceMs: 0 });
+    let status = "running";
+    const sent = [];
+    const port = {
+      async inspect() {
+        return { id: "agent-1", status, pendingPermissions: [] };
+      },
+      async send(agentId, text) {
+        sent.push(text);
+        status = "running";
+      },
+    };
+    await scheduler.submit(port, "agent-1", { text: "next task" });
+    status = "error";
+    await scheduler.onTurnEnded(port, "agent-1", { kind: "failed", error: { message: "socket hang up" } });
+    assert.equal(store.getDetail("agent-1").paused, true);
+    assert.equal(sent.length, 0);
+
+    // auto-retry's turn completes -> queue resumes and sends
+    status = "idle";
+    await scheduler.onTurnEnded(port, "agent-1", { kind: "completed" });
+    assert.deepEqual(sent, ["next task"]);
+
+    // A manual pause is never lifted by a completed turn
+    status = "running";
+    await scheduler.submit(port, "agent-1", { text: "held" });
+    store.setPaused("agent-1", true);
+    status = "error";
+    await scheduler.onTurnEnded(port, "agent-1", { kind: "failed", error: { message: "boom" } });
+    status = "idle";
+    await scheduler.onTurnEnded(port, "agent-1", { kind: "completed" });
+    assert.equal(store.getDetail("agent-1").paused, true);
+    assert.deepEqual(sent, ["next task"]);
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
   }
 });

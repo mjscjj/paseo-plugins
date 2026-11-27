@@ -29,6 +29,12 @@ die() { printf '[bb-queue] ERROR: %s\n' "$*" >&2; exit 1; }
 # Keep our own shim out of every command this script runs.
 unset NODE_OPTIONS || true
 
+# Inside a paseo-plugins checkout (~/.local/lib is the repo) this directory is tracked code:
+# replacing it with a clone of the standalone repo would break the checkout.
+if [ ! -d "$DIR/.git" ] && git -C "$(dirname "$DIR")" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  die "$DIR is part of the git checkout at $(git -C "$(dirname "$DIR")" rev-parse --show-toplevel). Update with: git -C $(dirname "$DIR") pull && paseo plugin reload $PLUGIN_ID (restart the daemon when shim/ changed)"
+fi
+
 # ---------------------------------------------------------------- preflight
 command -v git >/dev/null || die "git is required"
 command -v node >/dev/null || die "node is required (>= 20.6)"

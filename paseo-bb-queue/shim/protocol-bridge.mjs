@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 
 export const BB_PLUGIN_ID = "bb-queue";
 export const BB_INGEST_METHOD = "bb.ingest";
 export const BB_PREFIX = "bb ";
 export const BB_PREFIX_REGEX = /^\s*bb[^\S\r\n]+/i;
-export const CC_PLUGIN_ID = "cc-queue";
+// cc is a second queue inside the bb-queue plugin.
+export const CC_PLUGIN_ID = BB_PLUGIN_ID;
 export const CC_INGEST_METHOD = "cc.ingest";
 export const CC_PREFIX_REGEX = /^\s*cc[^\S\r\n]+/i;
 const BRIDGE_REQ_PREFIX = "__bbq_";
@@ -17,6 +21,31 @@ export const PREFIX_ROUTES = [
 
 function findRoute(text) {
   return PREFIX_ROUTES.find((route) => route.regex.test(text)) ?? null;
+}
+
+let configCache = { mtimeMs: -1, plugins: null };
+
+/**
+ * Whether the daemon config has the plugin installed and enabled. A prefix whose plugin is
+ * missing (e.g. "cc " on a machine with only bb-queue) is left as a normal message.
+ */
+export function isPluginConfigured(pluginId) {
+  const configPath = path.join(process.env.PASEO_HOME || path.join(homedir(), ".paseo"), "config.json");
+  try {
+    const { mtimeMs } = statSync(configPath);
+    if (mtimeMs !== configCache.mtimeMs) {
+      const config = JSON.parse(readFileSync(configPath, "utf8"));
+      configCache = {
+        mtimeMs,
+        plugins: config.pluginsEnabled === false ? {} : (config.plugins ?? {}),
+      };
+    }
+  } catch {
+    // Unreadable config: keep routing as before rather than silently dropping the queue.
+    return true;
+  }
+  const entry = configCache.plugins?.[pluginId];
+  return Boolean(entry) && entry.enabled !== false;
 }
 
 function decodeUtf8Frame(data) {
@@ -34,7 +63,7 @@ function decodeUtf8Frame(data) {
   return null;
 }
 
-export function createConnectionBridge() {
+export function createConnectionBridge({ isPluginAvailable = isPluginConfigured } = {}) {
   const pending = new Map();
 
   function transformInboundText(text) {
@@ -67,7 +96,7 @@ export function createConnectionBridge() {
       return null;
     }
     const route = findRoute(msg.text);
-    if (!route) {
+    if (!route || !isPluginAvailable(route.pluginId)) {
       return null;
     }
 
@@ -222,22 +251,24 @@ export function attachWsSocketBridge(ws) {
     return rawEmit(event, ...args);
   };
 
-  ws.send = function bridgedSend(data, ...rest) {
+  // Keep ws.send's (data, options, cb) arity: Paseo reads send.length to decide whether to wait
+  // for the write callback, and a shorter wrapper silently turns off its backpressure.
+  ws.send = function bridgedSend(data, options, cb) {
     if (typeof data === "string") {
       const rewritten = bridge.transformOutboundText(data);
       if (rewritten !== null) {
-        return rawSend(rewritten, ...rest);
+        return rawSend(rewritten, options, cb);
       }
     } else if (Buffer.isBuffer(data)) {
       // Only inspect when pending requests exist; binary terminal frames have no pending match.
       if (bridge.pendingCount > 0) {
         const rewritten = bridge.transformOutboundText(data.toString("utf8"));
         if (rewritten !== null) {
-          return rawSend(Buffer.from(rewritten, "utf8"), ...rest);
+          return rawSend(Buffer.from(rewritten, "utf8"), options, cb);
         }
       }
     }
-    return rawSend(data, ...rest);
+    return rawSend(data, options, cb);
   };
 
   return ws;

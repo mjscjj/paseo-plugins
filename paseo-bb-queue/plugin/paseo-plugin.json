@@ -1,7 +1,7 @@
 {
   "id": "bb-queue",
-  "name": "BB Server Queue",
-  "description": "Backend persistent FIFO message queue triggered by 'bb ' prefix or /bb command.",
+  "name": "BB/CC Queue",
+  "description": "Daemon-side message queues: 'bb ' (or /bb) sends when the agent is idle; 'cc ' (or /cc) sends on a timetable, N minutes apart.",
   "media": [],
   "requirements": {
     "paseo": ">=0.11.0"

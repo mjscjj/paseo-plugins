@@ -3,8 +3,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createBbQueueFilePeek, TimedQueueScheduler } from "../plugin/server/scheduler.ts";
-import { computeNextDueAt, QueueStore, stripCcPrefix } from "../plugin/server/store.ts";
+import { TimedQueueScheduler } from "../plugin/server/cc-scheduler.ts";
+import { computeNextDueAt, QueueStore, stripCcPrefix } from "../plugin/server/cc-store.ts";
 import { formatCountdown } from "../plugin/client/time-format.ts";
 
 const T0 = Date.parse("2026-11-27T14:00:00.000Z");
@@ -210,27 +210,28 @@ test("queue survives a restart and overdue items are sent once back", async () =
   }
 });
 
-test("bb queue file peek: ready, paused and missing queues", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "ccq-bb-"));
+test("a bb send in progress (shared lock) holds a due cc message back", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ccq-lock-"));
   try {
-    const file = path.join(dir, "queues.json");
-    const peek = createBbQueueFilePeek(file);
-    assert.equal(peek("a1"), false, "missing file");
-    writeFileSync(
-      file,
-      JSON.stringify({
-        version: 1,
-        queues: {
-          a1: { paused: false, pauseReason: null, items: [{ id: "x" }] },
-          a2: { paused: true, pauseReason: "手动暂停", items: [{ id: "y" }] },
-        },
-      }),
-    );
-    assert.equal(peek("a1"), true);
-    assert.equal(peek("a2"), false, "a paused bb queue does not hold cc back");
-    assert.equal(peek("a3"), false);
-    writeFileSync(file, "{not json");
-    assert.equal(peek("a1"), false, "unreadable file is treated as empty");
+    const store = new QueueStore(path.join(dir, "queues.json"));
+    const inFlight = new Set();
+    const scheduler = new TimedQueueScheduler(store, { now: () => T0 + 31 * MIN, inFlight });
+    const sent = [];
+    const port = {
+      async inspect(id) {
+        return { id, status: "idle", pendingPermissions: [] };
+      },
+      async send(agentId, text) {
+        sent.push(text);
+      },
+    };
+    store.enqueue("a1", { text: "due" }, { intervalMinutes: 30, nowMs: T0 });
+    inFlight.add("a1"); // bb is mid-send to a1
+    assert.equal(await scheduler.drainNext(port, "a1"), false);
+    assert.deepEqual(sent, []);
+    inFlight.delete("a1");
+    assert.equal(await scheduler.drainNext(port, "a1"), true);
+    assert.deepEqual(sent, ["due"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -330,6 +331,50 @@ test("cc wait limit: a due message waits for subagents at most the limit, never 
     await scheduler.sweep(port);
     assert.deepEqual(sent, ["timed"]);
     assert.match(scheduler.getTimeoutNotice("a1"), /超过 60 分钟/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("QueueStore: a late send pushes the rest back so the spacing survives a busy agent", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-spacing-"));
+  try {
+    const store = new QueueStore(path.join(dir, "queues.json"));
+    const t0 = Date.parse("2026-11-28T06:00:00Z");
+    for (const text of ["one", "two", "three"]) {
+      store.enqueue("a1", { text }, { intervalMinutes: 30, nowMs: t0 });
+    }
+    // Due 06:30, 07:00, 07:30; the agent is busy until 07:40.
+    const late = Date.parse("2026-11-28T07:40:00Z");
+    assert.equal(store.shiftDue("a1", late).text, "one");
+    assert.equal(store.peekDue("a1", late), null, "the second one is not due right away");
+    const next = store.getDetail("a1").items.map((i) => i.dueAt);
+    assert.deepEqual(next, ["2026-11-28T08:10:00.000Z", "2026-11-28T08:40:00.000Z"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("QueueStore: a failed turn pauses, a completed turn resumes; a manual pause stays", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-resume-"));
+  try {
+    const store = new QueueStore(path.join(dir, "queues.json"));
+    store.enqueue("a1", { text: "later", messageId: "m1" }, { intervalMinutes: 30 });
+    assert.equal(store.pauseAfterFailedTurn("a1", "上一轮执行失败: socket hang up"), true);
+    assert.equal(store.getDetail("a1").paused, true);
+    assert.equal(store.resumeAfterCompletedTurn("a1"), true);
+    assert.equal(store.getDetail("a1").paused, false);
+
+    store.setPaused("a1", true);
+    assert.equal(store.pauseAfterFailedTurn("a1", "x"), false);
+    assert.equal(store.resumeAfterCompletedTurn("a1"), false);
+    assert.equal(store.getDetail("a1").pauseReason, "手动暂停");
+
+    // A failed send goes back under a fresh messageId (Paseo refuses a reused one)
+    store.setPaused("a1", false);
+    const item = store.shiftDue("a1", Date.now() + 31 * 60_000);
+    store.requeueFrontAndPause("a1", item, "定时发送失败");
+    assert.match(store.getDetail("a1").items[0].messageId, /^m1~r[0-9a-z]+$/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

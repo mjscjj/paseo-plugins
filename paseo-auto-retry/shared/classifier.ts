@@ -4,7 +4,7 @@ const PERMANENT =
   /unauthori[sz]ed|forbidden|access token|sign[ -]?in|log[ -]?in|authenticat|quota|billing|usage limit|credit balance|context[ _-]?(?:window|length)|maximum context|permission denied|(?:user|manually) (?:cancel|interrupt)|(?:cancel|interrupt)(?:ed)? by (?:the )?user|invalid (?:api )?key|invalid (?:params|parameters|arguments)|model (?:not found|does not exist)|certificate (?:has expired|verify failed)|["']?\b(?:retryable|retriable)["']?\s*[:=]\s*false|登录失效|未授权|权限不足|额度(?:耗尽|用尽)|余额不足|上下文.*(?:超限|过长)|用户.*(?:取消|中止)/i;
 
 const NETWORK =
-  /stream ended without turnEnded|stream disconnected before completion|stream (?:ended|closed|terminated) (?:unexpectedly|prematurely)|connection (?:reset|dropped|lost|closed|refused|terminated|error)|socket (?:hang up|closed|disconnected)|\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|EHOSTUNREACH|ENETUNREACH|ENETDOWN|EPIPE|EAI_AGAIN|ENOTFOUND|UND_ERR_SOCKET|NetworkError|ConnectionError|TransportError|RemoteProtocolError|ChunkedEncodingError|RemoteDisconnected|ServerDisconnectedError)\b|network (?:connection|error|request failed|is unreachable)|fetch failed|failed to fetch|DNS (?:lookup|resolution).*fail|premature (?:close|end)|unexpected EOF|unexpected end of (?:stream|file)|transport (?:error|closed)|网络(?:连接)?(?:中断|异常|失败)|连接(?:中断|重置|断开)/i;
+  /stream ended without turnEnded|stream disconnected before completion|stream (?:ended|closed|terminated) (?:unexpectedly|prematurely)|connection (?:reset|dropped|lost|closed|refused|terminated|error)|socket (?:hang up|closed|disconnected)|other side closed|error sending request|TypeError: terminated|\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|EHOSTUNREACH|ENETUNREACH|ENETDOWN|EPIPE|EAI_AGAIN|ENOTFOUND|UND_ERR_SOCKET|NetworkError|ConnectionError|TransportError|RemoteProtocolError|ChunkedEncodingError|RemoteDisconnected|ServerDisconnectedError)\b|network (?:connection|error|request failed|is unreachable)|fetch failed|failed to fetch|DNS (?:lookup|resolution).*fail|premature (?:close|end)|unexpected EOF|unexpected end of (?:stream|file)|transport (?:error|closed)|网络(?:连接)?(?:中断|异常|失败)|连接(?:中断|重置|断开)/i;
 
 const TIMEOUT =
   /\b(?:ETIMEDOUT|ESOCKETTIMEDOUT|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|[A-Za-z]*TimeoutError)\b|(?:request|connection|connect|read|write|socket|stream|operation|upstream|response|ping|keepalive|heartbeat) (?:has )?(?:timed out|timeout)|deadline exceeded|超时/i;
@@ -16,6 +16,11 @@ const RETRIABLE =
   /\b(?:Retriable|Retryable)Error\b|"retryable"\s*:\s*true|\bretriable\s*[:=]\s*true/i;
 
 const RATE_LIMIT = /rate[ _-]?limit|too many requests|请求过于频繁|限流/i;
+
+// Per-minute quotas reset by themselves; only billing/usage quotas need a human.
+const SHORT_QUOTA = /quota\b.*\bper (?:minute|second)|per[ -]minute quota|resource[_ ]exhausted/i;
+
+const MAX_RETRY_AFTER_SECONDS = 15 * 60;
 
 export type ErrorCategory =
   | "requires-intervention"
@@ -63,6 +68,8 @@ export function classifyError(
 ): ErrorClassification | null {
   if (typeof text !== "string" || !text.trim()) return null;
   if (rendered && !renderedError(text)) return null;
+  // A URL such as https://login.example.com must not read as a sign-in error.
+  text = text.replace(/https?:\/\/\S+/gi, "<URL>");
 
   const statusMatch =
     text.match(
@@ -71,6 +78,9 @@ export function classifyError(
     text.match(/^(?:\[System Error\]\s*)?(?:Error:\s*)?(\d{3})\b/)?.[1];
   const status = statusMatch ? Number(statusMatch) : Number.NaN;
 
+  if (SHORT_QUOTA.test(text)) {
+    return { category: "rate-limit", retryable: true };
+  }
   if (
     PERMANENT.test(text) ||
     [400, 401, 402, 403, 404, 405, 413, 422, 501, 505, 511].includes(status)
@@ -99,10 +109,11 @@ export function classifyError(
 }
 
 export function extractRetryAfterSeconds(text: string): number {
-  const match = text.match(/retry[- ]after\s*[:=]?\s*(\d+)\b/i);
-  if (!match) return 0;
+  // Seconds only; "retry after 3:45 PM" is a clock time, not 3 seconds.
+  const match = text.match(/retry[- ]after\s*[:=]?\s*(\d+)(?![\d:.])\s*(ms|milliseconds?)?/i);
+  if (!match || match[2]) return 0;
   const seconds = Number(match[1]);
-  return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+  return Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds, MAX_RETRY_AFTER_SECONDS) : 0;
 }
 
 export function redactError(text: string): string {

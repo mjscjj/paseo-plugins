@@ -1,15 +1,16 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
-import { contributeQueueComposer, createClientErrorReporter } from "./client/composer.tsx";
-import { TimingSettingsScreen } from "./client/settings-screen.tsx";
-import { contributeQueueTimeline } from "./client/timeline.tsx";
+import { contributeQueueComposer, createClientErrorReporter } from "./cc-composer.tsx";
+import { TimingSettingsScreen } from "./cc-settings-screen.tsx";
+import { contributeQueueTimeline } from "./cc-timeline.tsx";
 
-export default function contribute(client: PluginClientContext) {
+/** The "cc " timed queue's composer pill, panel, timeline cards and settings. */
+export function contributeTimedQueueClient(client: PluginClientContext): () => void {
   const errorReporter = createClientErrorReporter();
   const removeComposer = contributeQueueComposer(client, errorReporter);
   const removeTimeline = contributeQueueTimeline(client);
   const removeSettings = client.addSettingsScreen({
-    id: "timing",
-    title: "定时间隔",
+    id: "cc-timing",
+    title: "CC 定时间隔",
     icon: "Clock",
     Component: TimingSettingsScreen,
   });
@@ -20,7 +21,7 @@ export default function contribute(client: PluginClientContext) {
     keywords: ["cc", "定时", "间隔", "interval"],
     context: "global",
     onSelect({ openSettings }) {
-      openSettings("timing");
+      openSettings("cc-timing");
     },
   });
 

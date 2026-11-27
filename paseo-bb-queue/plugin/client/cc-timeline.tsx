@@ -2,8 +2,8 @@ import type { PluginClientContext, PluginTimelineItemProps } from "@getpaseo/plu
 import { copyText, Icon, useToast } from "@getpaseo/plugin/client/react-native";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { z } from "zod";
-import { CC_PREFIX_REGEX } from "../shared/contracts.ts";
-import { useAgentQueue } from "./hooks.ts";
+import { CC_PREFIX_REGEX } from "../shared/cc-contracts.ts";
+import { useAgentQueue } from "./cc-hooks.ts";
 
 const TIMELINE_DISPATCHED_KIND = "cc-dispatched-message";
 const TIMELINE_DISPATCHED_VERSION = 1;

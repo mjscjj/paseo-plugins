@@ -28,6 +28,8 @@ export type StoredQueuedItem = z.infer<typeof StoredQueuedItemSchema>;
 const StoredAgentQueueSchema = z.object({
   paused: z.boolean(),
   pauseReason: z.string().nullable(),
+  /** Paused by a failed turn: the next completed turn (e.g. an auto-retry) resumes it. */
+  resumeOnCompletedTurn: z.boolean().optional(),
   updatedAt: z.string().optional(),
   items: z.array(StoredQueuedItemSchema),
 });
@@ -40,6 +42,7 @@ const PersistedStoreSchema = z.object({
 interface AgentQueueRecord {
   paused: boolean;
   pauseReason: string | null;
+  resumeOnCompletedTurn?: boolean;
   updatedAt: string;
   items: StoredQueuedItem[];
 }
@@ -50,6 +53,16 @@ export interface EnqueuePayload {
   images?: Array<{ data: string; mimeType: string }>;
   attachments?: unknown[];
   sessionMode?: string;
+}
+
+/**
+ * Paseo keeps a receipt per messageId, including for sends that failed, so a retried send needs
+ * a fresh id or it is refused as already handled.
+ */
+function withFreshMessageId(item: StoredQueuedItem): StoredQueuedItem {
+  if (!item.messageId) return item;
+  const base = item.messageId.replace(/~r[0-9a-z]+$/, "");
+  return { ...item, messageId: `${base}~r${Date.now().toString(36)}` };
 }
 
 export function stripBbPrefix(rawText: string): string {
@@ -124,6 +137,7 @@ export class QueueStore {
         this.queues.set(agentId, {
           paused: record.paused,
           pauseReason: record.pauseReason,
+          ...(record.resumeOnCompletedTurn ? { resumeOnCompletedTurn: true } : {}),
           updatedAt: record.updatedAt ?? record.items.at(-1)?.createdAt ?? now,
           items: [...record.items],
         });
@@ -261,6 +275,7 @@ export class QueueStore {
   }
 
   restoreItemAt(agentId: string, item: StoredQueuedItem, index: number): void {
+    item = withFreshMessageId(item);
     const record = this.getOrCreate(agentId);
     const clamped = Math.max(0, Math.min(index, record.items.length));
     record.items.splice(clamped, 0, item);
@@ -270,21 +285,37 @@ export class QueueStore {
 
   requeueFrontAndPause(agentId: string, item: StoredQueuedItem, reason: string): void {
     const record = this.getOrCreate(agentId);
-    record.items.unshift(item);
+    record.items.unshift(withFreshMessageId(item));
     record.paused = true;
     record.pauseReason = reason;
+    record.resumeOnCompletedTurn = false;
     record.updatedAt = new Date().toISOString();
     this.persist();
   }
 
-  pauseIfNonEmpty(agentId: string, reason: string): boolean {
+  pauseIfNonEmpty(agentId: string, reason: string, resumeOnCompletedTurn = false): boolean {
     const record = this.queues.get(agentId);
-    if (!record || record.items.length === 0) {
+    if (!record || record.items.length === 0 || record.paused) {
+      // Already paused (by hand or earlier): keep that reason and do not make it auto-resume.
       return false;
     }
     record.paused = true;
     record.pauseReason = reason;
+    record.resumeOnCompletedTurn = resumeOnCompletedTurn;
     record.updatedAt = new Date().toISOString();
+    this.persist();
+    return true;
+  }
+
+  /** Resumes a queue that a failed turn paused, once a later turn completes. */
+  resumeAfterCompletedTurn(agentId: string): boolean {
+    const record = this.queues.get(agentId);
+    if (!record?.paused || !record.resumeOnCompletedTurn) return false;
+    record.paused = false;
+    record.pauseReason = null;
+    record.resumeOnCompletedTurn = false;
+    record.updatedAt = new Date().toISOString();
+    this.pruneIfEmpty(agentId);
     this.persist();
     return true;
   }
@@ -293,6 +324,7 @@ export class QueueStore {
     const record = this.getOrCreate(agentId);
     record.paused = paused;
     record.pauseReason = paused ? (reason ?? "手动暂停") : null;
+    record.resumeOnCompletedTurn = false;
     record.updatedAt = new Date().toISOString();
     this.pruneIfEmpty(agentId);
     this.persist();
