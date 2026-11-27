@@ -10,6 +10,7 @@ export const BB_PREFIX_REGEX = /^\s*bb[^\S\r\n]+/i;
 
 export const DEFAULT_INTERVAL_MINUTES = 30;
 export const MAX_INTERVAL_MINUTES = 24 * 60;
+export const DEFAULT_MAX_SUBAGENT_WAIT_MINUTES = 60;
 
 export const timingSettings = defineSettings({
   id: "timing",
@@ -22,6 +23,13 @@ export const timingSettings = defineSettings({
       .min(1, "至少 1 分钟")
       .max(MAX_INTERVAL_MINUTES, "最多 1440 分钟（24 小时）")
       .default(DEFAULT_INTERVAL_MINUTES),
+    /** After a message is due: longest wait for busy subagents once the root is idle; 0 = no limit. */
+    maxSubagentWaitMinutes: z
+      .number()
+      .int("请输入整数分钟")
+      .min(0, "不能小于 0")
+      .max(MAX_INTERVAL_MINUTES, "最多 1440 分钟（24 小时）")
+      .default(DEFAULT_MAX_SUBAGENT_WAIT_MINUTES),
   }),
 });
 
@@ -69,6 +77,7 @@ export const AgentQueueDetailSchema = z.object({
   dispatchedTexts: z.record(z.string(), z.string()),
   intervalMinutes: z.number().int().positive().optional(),
   waitingReason: z.string().nullable().optional(),
+  timeoutNotice: z.string().nullable().optional(),
 });
 
 export type AgentQueueDetail = z.infer<typeof AgentQueueDetailSchema>;

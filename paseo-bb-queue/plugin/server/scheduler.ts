@@ -5,6 +5,7 @@ import {
   type ProviderSubagentTracker,
   type TreeBusyReport,
   type TreeNodeSnapshot,
+  TreeWaitLimiter,
 } from "./agent-tree.ts";
 import {
   assertNonEmptyPayload,
@@ -21,7 +22,12 @@ export interface QueueSchedulerOptions {
   turnEndGraceMs?: number;
   frontendHoldMaxWaitMs?: number;
   frontendHoldTtlMs?: number;
+  /** Longest one message waits for busy subagents once the root is idle; 0 = no limit. */
+  maxTreeWaitMs?: () => number;
+  now?: () => number;
 }
+
+const DEFAULT_MAX_TREE_WAIT_MS = 60 * 60_000;
 
 export interface AgentSendOptions {
   messageId?: string;
@@ -110,6 +116,7 @@ export class QueueScheduler {
   private readonly frontendHolds = new Map<string, number>();
   private readonly pendingDrainTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly waitingReasons = new Map<string, string>();
+  private readonly waitLimiter: TreeWaitLimiter;
   private readonly turnEndGraceMs: number;
   private readonly frontendHoldMaxWaitMs: number;
   private readonly frontendHoldTtlMs: number;
@@ -120,6 +127,20 @@ export class QueueScheduler {
     this.frontendHoldMaxWaitMs =
       options.frontendHoldMaxWaitMs ?? DEFAULT_FRONTEND_HOLD_MAX_WAIT_MS;
     this.frontendHoldTtlMs = options.frontendHoldTtlMs ?? DEFAULT_FRONTEND_HOLD_TTL_MS;
+    this.waitLimiter = new TreeWaitLimiter({
+      maxWaitMs: options.maxTreeWaitMs ?? (() => DEFAULT_MAX_TREE_WAIT_MS),
+      now: options.now,
+    });
+  }
+
+  /** Shown after a message went out because the subagent wait limit ran out. */
+  getTimeoutNotice(agentId: string): string | null {
+    return this.waitLimiter.getNotice(agentId);
+  }
+
+  /** Pausing or clearing ends the current message's wait clock. */
+  resetTreeWait(agentId: string): void {
+    this.waitLimiter.reset(agentId);
   }
 
   private clearPendingDrainTimer(agentId: string): void {
@@ -194,6 +215,7 @@ export class QueueScheduler {
     this.pendingDrainTimers.clear();
     this.frontendHolds.clear();
     this.waitingReasons.clear();
+    this.waitLimiter.dispose();
   }
 
   /** Retry every agent whose queue is ready but idle-waiting (e.g. on subagents to finish). */
@@ -321,6 +343,7 @@ export class QueueScheduler {
     }
     this.clearPendingDrainTimer(agentId);
     this.inFlight.add(agentId);
+    let timedOut = false;
     try {
       try {
         const agent = await port.inspect(agentId);
@@ -329,9 +352,15 @@ export class QueueScheduler {
         }
         const tree = await inspectTreeOrQuiet(port, agent);
         if (tree.busy) {
-          // The sweep retries; a subagent finishing does not always start a parent turn.
-          this.setWaitingReason(agentId, tree.reason);
-          return false;
+          const head = this.store.peekReady(agentId);
+          if (!head) return false;
+          const decision = this.waitLimiter.evaluate(agentId, head.id, tree.reason);
+          if (!decision.send) {
+            // The sweep retries; a subagent finishing does not always start a parent turn.
+            this.setWaitingReason(agentId, decision.reason);
+            return false;
+          }
+          timedOut = true;
         }
         if (!(await stillIdleBeforeSend(port, agentId))) {
           return false;
@@ -350,6 +379,11 @@ export class QueueScheduler {
       try {
         await port.send(agentId, nextItem.text, toSendOptions(nextItem));
         this.store.recordDispatched(agentId, nextItem.messageId, nextItem.text);
+        this.waitLimiter.reset(agentId);
+        if (timedOut) {
+          this.waitLimiter.recordTimeout(agentId, nextItem.text);
+          console.log(`[bb-queue] ${agentId}: subagent wait limit reached, sent anyway`);
+        }
         return true;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

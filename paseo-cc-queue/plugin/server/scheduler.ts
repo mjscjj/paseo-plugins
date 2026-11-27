@@ -6,6 +6,7 @@ import {
   type ProviderSubagentTracker,
   type TreeBusyReport,
   type TreeNodeSnapshot,
+  TreeWaitLimiter,
 } from "./agent-tree.ts";
 import {
   assertNonEmptyPayload,
@@ -101,7 +102,11 @@ export interface TimedSchedulerOptions {
   frontendHoldTtlMs?: number;
   now?: () => number;
   bbQueuePeek?: BbQueuePeek;
+  /** Longest a due message waits for busy subagents once the root is idle; 0 = no limit. */
+  maxTreeWaitMs?: () => number;
 }
+
+const DEFAULT_MAX_TREE_WAIT_MS = 60 * 60_000;
 
 /**
  * Timed queue: every message waits until its dueAt, then until the agent tree is quiet,
@@ -115,12 +120,25 @@ export class TimedQueueScheduler {
   private readonly frontendHoldTtlMs: number;
   private readonly now: () => number;
   private readonly bbQueuePeek: BbQueuePeek;
+  private readonly waitLimiter: TreeWaitLimiter;
 
   constructor(store: QueueStore, options: TimedSchedulerOptions = {}) {
     this.store = store;
     this.frontendHoldTtlMs = options.frontendHoldTtlMs ?? DEFAULT_FRONTEND_HOLD_TTL_MS;
     this.now = options.now ?? Date.now;
     this.bbQueuePeek = options.bbQueuePeek ?? (() => false);
+    this.waitLimiter = new TreeWaitLimiter({
+      maxWaitMs: options.maxTreeWaitMs ?? (() => DEFAULT_MAX_TREE_WAIT_MS),
+      now: this.now,
+    });
+  }
+
+  getTimeoutNotice(agentId: string): string | null {
+    return this.waitLimiter.getNotice(agentId);
+  }
+
+  resetTreeWait(agentId: string): void {
+    this.waitLimiter.reset(agentId);
   }
 
   getWaitingReason(agentId: string): string | null {
@@ -201,6 +219,7 @@ export class TimedQueueScheduler {
   async drainNext(port: AgentPort, agentId: string): Promise<boolean> {
     if (this.inFlight.has(agentId) || !this.store.hasDueItems(agentId, this.now())) return false;
     this.inFlight.add(agentId);
+    let timedOut = false;
     try {
       try {
         const agent = await port.inspect(agentId);
@@ -223,8 +242,14 @@ export class TimedQueueScheduler {
         if (port.inspectTree) {
           const tree = await port.inspectTree(agent);
           if (tree.busy) {
-            this.setWaitingReason(agentId, tree.reason);
-            return false;
+            const head = this.store.peekDue(agentId, this.now());
+            if (!head) return false;
+            const decision = this.waitLimiter.evaluate(agentId, head.id, tree.reason);
+            if (!decision.send) {
+              this.setWaitingReason(agentId, decision.reason);
+              return false;
+            }
+            timedOut = true;
           }
           // The tree walk takes several round trips; a finish notice can start a parent turn
           // meanwhile, and a plugin send interrupts a running turn. Re-read the root first.
@@ -245,6 +270,11 @@ export class TimedQueueScheduler {
       try {
         await port.send(agentId, nextItem.text, toSendOptions(nextItem));
         this.store.recordDispatched(agentId, nextItem.messageId, nextItem.text);
+        this.waitLimiter.reset(agentId);
+        if (timedOut) {
+          this.waitLimiter.recordTimeout(agentId, nextItem.text);
+          console.log(`[cc-queue] ${agentId}: subagent wait limit reached, sent anyway`);
+        }
         return true;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -260,5 +290,6 @@ export class TimedQueueScheduler {
   dispose(): void {
     this.frontendHolds.clear();
     this.waitingReasons.clear();
+    this.waitLimiter.dispose();
   }
 }

@@ -1,10 +1,28 @@
-import { defineRpc } from "@getpaseo/plugin";
+import { defineRpc, defineSettings } from "@getpaseo/plugin";
 import { z } from "zod";
 
 export const BB_PLUGIN_ID = "bb-queue";
 export const BB_PREFIX = "bb ";
 export const BB_PREFIX_REGEX = /^\s*bb[^\S\r\n]+/i;
 export const BB_INGEST_METHOD = "bb.ingest";
+
+export const DEFAULT_MAX_SUBAGENT_WAIT_MINUTES = 60;
+export const MAX_SUBAGENT_WAIT_LIMIT_MINUTES = 24 * 60;
+
+/** 0 means wait for subagents without a limit. */
+export const waitSettings = defineSettings({
+  id: "subagent-wait",
+  scope: "host",
+  version: 1,
+  schema: z.object({
+    maxSubagentWaitMinutes: z
+      .number()
+      .int("请输入整数分钟")
+      .min(0, "不能小于 0")
+      .max(MAX_SUBAGENT_WAIT_LIMIT_MINUTES, "最多 1440 分钟（24 小时）")
+      .default(DEFAULT_MAX_SUBAGENT_WAIT_MINUTES),
+  }),
+});
 
 export const ActiveSendBehaviorSchema = z.enum(["steer", "interrupt"]);
 export type ActiveSendBehavior = z.infer<typeof ActiveSendBehaviorSchema>;
@@ -47,6 +65,8 @@ export const AgentQueueDetailSchema = z.object({
   withdrawnMessageIds: z.array(z.string()),
   dispatchedTexts: z.record(z.string(), z.string()),
   waitingReason: z.string().nullable().optional(),
+  /** Set for a while after a message was sent because the subagent wait limit ran out. */
+  timeoutNotice: z.string().nullable().optional(),
 });
 
 export type AgentQueueDetail = z.infer<typeof AgentQueueDetailSchema>;

@@ -5,6 +5,7 @@ import {
   CC_PLUGIN_ID,
   clearQueueRpc,
   DEFAULT_INTERVAL_MINUTES,
+  DEFAULT_MAX_SUBAGENT_WAIT_MINUTES,
   enqueueManualRpc,
   getAgentQueueRpc,
   ingestRpc,
@@ -33,19 +34,23 @@ function paseoHome(): string {
 
 export default function contribute(server: PluginServerContext) {
   const store = new QueueStore(path.join(paseoHome(), "plugin-data", CC_PLUGIN_ID, "queues.json"));
+  let intervalMinutes = DEFAULT_INTERVAL_MINUTES;
+  let maxSubagentWaitMinutes = DEFAULT_MAX_SUBAGENT_WAIT_MINUTES;
   const scheduler = new TimedQueueScheduler(store, {
     bbQueuePeek: createBbQueueFilePeek(path.join(paseoHome(), "plugin-data", "bb-queue", "queues.json")),
+    maxTreeWaitMs: () => maxSubagentWaitMinutes * 60_000,
   });
   const tracker = new ProviderSubagentTracker();
   const settings = server.registerSettings(timingSettings);
-  let intervalMinutes = DEFAULT_INTERVAL_MINUTES;
   // Paseo hands the plugin its API only inside handlers and events; it is the same object for
   // the plugin process lifetime, so keep it for the sweep timer.
   let latestPaseo: PluginHandlerContext["paseo"] | null = null;
   let sweeping = false;
 
   const applySettings = (state: Awaited<ReturnType<typeof settings.read>>) => {
-    if (state.status === "ready") intervalMinutes = state.values.intervalMinutes;
+    if (state.status !== "ready") return;
+    intervalMinutes = state.values.intervalMinutes;
+    maxSubagentWaitMinutes = state.values.maxSubagentWaitMinutes;
   };
   void settings.read().then(applySettings, (error) => {
     console.error("[cc-queue] failed to read settings:", error);
@@ -62,6 +67,7 @@ export default function contribute(server: PluginServerContext) {
     ...detail,
     intervalMinutes,
     waitingReason: scheduler.getWaitingReason(detail.agentId),
+    timeoutNotice: scheduler.getTimeoutNotice(detail.agentId),
   });
 
   const runSweep = () => {
@@ -139,12 +145,16 @@ export default function contribute(server: PluginServerContext) {
   );
 
   server.handle(setQueuePausedRpc, async ({ agentId, paused }, { paseo }) => {
+    if (paused) scheduler.resetTreeWait(agentId);
     const detail = store.setPaused(agentId, paused);
     if (!paused) await scheduler.drainNext(portFor(paseo), agentId);
     return decorate(paused ? detail : store.getDetail(agentId));
   });
 
-  server.handle(clearQueueRpc, ({ agentId }) => decorate(store.clear(agentId)));
+  server.handle(clearQueueRpc, ({ agentId }) => {
+    scheduler.resetTreeWait(agentId);
+    return decorate(store.clear(agentId));
+  });
 
   // Agent activity is the earliest moment the plugin gets its API after a (re)start.
   server.on("agent.turn_started", (_event, { paseo }) => {
