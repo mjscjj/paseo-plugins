@@ -560,6 +560,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send(200, public_node(node))
 
 
+class DualStackServer(ThreadingHTTPServer):
+    """Listen on IPv4 and IPv6: some machines reach the hub only over one of them."""
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
 def main():
     global SELF_SERVER
     (HOME / "tasks").mkdir(parents=True, exist_ok=True)
@@ -567,7 +576,7 @@ def main():
     resume()
     threading.Thread(target=edge_loop, daemon=True).start()
     log(f"fleet registry on :{PORT}, data in {HOME}, self {SELF_SERVER}")
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    DualStackServer(("::", PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":
