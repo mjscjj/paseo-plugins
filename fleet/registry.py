@@ -358,7 +358,8 @@ def work(path, reply=None):
             log(f"task #{meta['id']} running on {meta['to']} as {agent_id}")
         elif reply:
             baseline = len(replies(agent_id, endpoint))
-            paseo(["send", agent_id, "--behavior", "queue", "--no-wait", "--prompt",
+            # Replies only go to an idle agent, so the default delivery interrupts nothing.
+            paseo(["send", agent_id, "--no-wait", "--prompt",
                    f"[机群任务 #{meta['id']} 追问]\n\n{reply}\n\n---\n干完后最后一条消息照样写清楚结果。"], endpoint, timeout=180)
         begun = time.time()
         while time.time() - begun < TASK_LIMIT:
