@@ -5,7 +5,6 @@
 !/paseo-bb-queue/
 !/paseo-auto-retry/
 !/paseo-unread-count/
-!/fleet/
 
 node_modules/
 # macOS 拷贝带来的 AppleDouble 元数据
