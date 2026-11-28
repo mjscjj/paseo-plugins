@@ -9,6 +9,8 @@
   fleet stop ID                    stop a task that is still running
   fleet ls [--to N] [--status S]   tasks sent through the hub
   fleet show ID                    one task: what was asked, the back and forth, the result
+  fleet kb [FILE] [--ls] [--put]   knowledge base on the hub: read a file (default README.md),
+                                   list files, or replace a file with stdin
   fleet report                     heartbeat (cron / launchd run this every 2 minutes)
 
 Standard library only. Config: ~/.config/fleet/node.json. Work dir: ~/fleet/work.
@@ -25,6 +27,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -62,13 +65,16 @@ def env_with_path(config=None):
     return env
 
 
-def call_hub(config, method, path, body=None, timeout=20):
-    request = urllib.request.Request(config["hub"].rstrip("/") + path, method=method,
-                                     data=json.dumps(body).encode() if body is not None else None,
-                                     headers={"Content-Type": "application/json"})
+def call_hub(config, method, path, body=None, timeout=20, raw=False):
+    data = body.encode() if raw and body is not None else json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(config["hub"].rstrip("/") + path, method=method, data=data,
+                                     headers={"Content-Type": "text/markdown" if raw else "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read() or b"null")
+            content = response.read()
+            if raw and method == "GET":
+                return content.decode()
+            return json.loads(content or b"null")
     except urllib.error.HTTPError as error:
         try:
             message = json.loads(error.read()).get("error")
@@ -310,6 +316,19 @@ def cmd_show(args):
     print(call_hub(config, "GET", f"/api/tasks/{args.id}")["text"])
 
 
+def cmd_kb(args):
+    config = load_config()
+    name = urllib.parse.quote(args.file)
+    if args.ls:
+        for f in call_hub(config, "GET", "/api/kb"):
+            print(f"{f['path']:<32} {f['modified']}  {f['size']} B")
+    elif args.put:
+        written = call_hub(config, "PUT", f"/api/kb/{name}", sys.stdin.read(), raw=True)
+        print(f"已写入 kb/{written['path']}（{written['size']} B）")
+    else:
+        print(call_hub(config, "GET", f"/api/kb/{name}", raw=True), end="")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="fleet", description="机群：查看机器、派活、看记录")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -364,6 +383,12 @@ def main():
     p = sub.add_parser("show", help="看一条派活的完整记录")
     p.add_argument("id")
     p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("kb", help="知识中心：机器、账号、密钥等通用知识（中心上的 Markdown 文件）")
+    p.add_argument("file", nargs="?", default="README.md", help="文件路径，默认 README.md（原则和目录）")
+    p.add_argument("--ls", action="store_true", help="列出全部文件")
+    p.add_argument("--put", action="store_true", help="用标准输入整篇替换这个文件（不存在就新建）")
+    p.set_defaults(func=cmd_kb)
 
     args = parser.parse_args()
     args.func(args)

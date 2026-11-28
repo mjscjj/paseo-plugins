@@ -1,13 +1,13 @@
 # fleet：机群注册中心和派活记录
 
-几台机器组成一个机群：一台中心登记所有机器、知道怎么连到每台的 Paseo；任何人或任何 Agent 都通过中心把活派给某台机器的默认 Agent，每个活记成中心上的一个 Markdown 文件，可以追问、叫停。执行完全交给 Paseo，这里只补登记、连法和记录。只用 Python 标准库。
+几台机器组成一个机群：一台中心登记所有机器、知道怎么连到每台的 Paseo；任何人或任何 Agent 都通过中心把活派给某台机器的默认 Agent，每个活记成中心上的一个 Markdown 文件，可以追问、叫停。执行完全交给 Paseo，这里只补登记、连法和记录。中心还放着一个知识中心：一组所有 Agent 共用的 Markdown 文件（机器、账号、密钥、模型等），任何机器用 `fleet kb` 读写。只用 Python 标准库。
 
 ## 组成
 
 | 文件 | 在哪跑 | 作用 |
 |---|---|---|
-| `registry.py` | 只在中心 | HTTP 服务（6780，IPv4+IPv6）：节点登记与心跳、派活 / 追问 / 叫停接口、任务记录、状态页 |
-| `fleet` | 每台机器 | 命令行：`join` / `leave` / `nodes` / `run` / `reply` / `stop` / `ls` / `show` / `report` |
+| `registry.py` | 只在中心 | HTTP 服务（6780，IPv4+IPv6）：节点登记与心跳、派活 / 追问 / 叫停接口、任务记录、知识中心、状态页 |
+| `fleet` | 每台机器 | 命令行：`join` / `leave` / `nodes` / `run` / `reply` / `stop` / `ls` / `show` / `kb` / `report` |
 | `skills/fleet/SKILL.md` | 每台机器 | 告诉 Agent 怎么看机群、怎么派活、收到机群任务怎么交结果；`join` 时软链进 `~/.agents/skills`、`~/.claude/skills`、`~/.codex/skills`、`~/.trae/skills`（存在的才链） |
 | `systemd/fleet-registry.service` | 只在中心 | 用户服务 |
 | `systemd/fleet-tunnel@.service` | 只在中心 | 给连不到中心的机器开反向 SSH 隧道，让它在自己的 `127.0.0.1:6780` 访问中心 |
@@ -34,6 +34,10 @@
 - `fleet stop <编号>`：停掉对方的 Agent，状态 `stopped`。
 
 任务文件开头是 `id / title / from / to / agent / status / created / started / finished / rounds / cwd / paseo_agent`，正文是「任务」「往来」（有追问才有）「结果」。`from` 是派活机器名，从 Paseo Agent 里派时带上那个 Agent 的短 id。
+
+## 知识中心
+
+中心的 `~/fleet/kb/` 是一组 Markdown 文件，`README.md` 写原则和目录。接口：`GET /api/kb`（文件列表）、`GET /api/kb/<文件>`（原文）、`PUT /api/kb/<文件>`（整篇替换，不存在就新建）；页面 `/kb`。只能读写 kb 目录里的 `.md`。命令行 `fleet kb [文件] [--ls] [--put]`。内容只在中心，不进本仓库（本仓库是公开的）。
 
 ## 安装
 
@@ -63,4 +67,4 @@ fleet join http://<中心IP>:6780 --name <名字> --agent traecli/gpt-6.2-sol/hi
 
 - `fleet nodes` 里离线：看那台机器的 `~/fleet/report.log`，或手动 `fleet report`。
 - 派出去一直 `queued` 或 `failed`：中心日志 `journalctl --user -u fleet-registry`；连法是 relay 时先在中心试 `paseo ls --host '<配对链接>'`。
-- 数据都在中心 `~/fleet/`：`nodes.json`（节点表）、`counter`、`tasks/`。
+- 数据都在中心 `~/fleet/`：`nodes.json`（节点表）、`counter`、`tasks/`、`kb/`。

@@ -7,6 +7,9 @@ Paseo: the hub creates an agent on the target daemon with that machine's
 default agent, writes the result back into the task file, and can carry on
 the same conversation (reply) or stop it.
 
+It also serves the knowledge base: a folder of Markdown files (kb/) every
+agent in the fleet reads and edits through the hub.
+
 Standard library only. Data lives in $FLEET_HOME (default ~/fleet).
 """
 
@@ -23,7 +26,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 HOME = Path(os.environ.get("FLEET_HOME", Path.home() / "fleet")).expanduser()
 PORT = int(os.environ.get("FLEET_PORT", "6780"))
@@ -50,6 +53,36 @@ def stamp(moment=None):
 
 def log(message):
     print(f"{stamp()} {message}", flush=True)
+
+
+# ---- knowledge base --------------------------------------------------------
+
+def kb_dir():
+    return HOME / "kb"
+
+
+def kb_path(name):
+    """A Markdown file under kb/; anything else is rejected."""
+    name = unquote(name).strip("/") or "README.md"
+    path = (kb_dir() / name).resolve()
+    if path.suffix != ".md" or kb_dir().resolve() not in path.parents:
+        raise ValueError("只能读写 kb 目录里的 .md 文件")
+    return path
+
+
+def kb_list():
+    root = kb_dir()
+    return [{"path": str(f.relative_to(root)), "size": f.stat().st_size, "modified": stamp(datetime.fromtimestamp(f.stat().st_mtime).astimezone())}
+            for f in sorted(root.rglob("*.md"))]
+
+
+def kb_write(name, text):
+    path = kb_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".md.tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+    return {"path": str(path.relative_to(kb_dir().resolve())), "size": len(text.encode())}
 
 
 # ---- nodes ---------------------------------------------------------------
@@ -443,7 +476,7 @@ th,td{text-align:left;padding:7px 10px;border-bottom:1px solid #eee;vertical-ali
 .muted{color:#8f8f8f}.chip{padding:1px 8px;border-radius:999px;background:#f2f2f2;font-size:12px}
 .done{background:#edf3ec;color:#2b6e46}.failed{background:#fdebec;color:#a8302b}.running,.blocked{background:#e7f3f8;color:#2b6a8f}
 a{color:#2383e2;text-decoration:none}pre{white-space:pre-wrap;background:#fafafa;padding:12px;border-radius:8px}
-nav a{margin-right:12px}</style>"""
+nav a{margin-right:12px}</style><nav><a href='/'>机群</a><a href='/kb'>知识中心</a></nav>"""
 
 
 def render_index(query):
@@ -473,7 +506,15 @@ def render_task(task_id):
     path = find_task(task_id)
     if not path:
         return None
-    return PAGE + f"<nav><a href='/'>← 机群</a><span class=muted>{html.escape(str(path))}</span></nav><pre>{html.escape(path.read_text())}</pre>"
+    return PAGE + f"<p class=muted>{html.escape(str(path))}</p><pre>{html.escape(path.read_text())}</pre>"
+
+
+def render_kb(name):
+    path = kb_path(name)
+    if not path.exists():
+        return None
+    files = "".join(f"<li><a href='/kb/{html.escape(f['path'])}'>{html.escape(f['path'])}</a> <span class=muted>{f['modified']}</span></li>" for f in kb_list())
+    return PAGE + f"<h2>{html.escape(str(path.relative_to(kb_dir().resolve())))}</h2><pre>{html.escape(path.read_text())}</pre><h2>全部文件</h2><ul>{files}</ul>"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -501,6 +542,20 @@ class Handler(BaseHTTPRequestHandler):
         if match:
             page = render_task(match.group(1))
             return self.send(200, page, "text/html") if page else self.send(404, "没有这个任务", "text/plain")
+        if url.path == "/kb" or url.path.startswith("/kb/"):
+            try:
+                page = render_kb(url.path[3:])
+            except ValueError as error:
+                return self.send(400, str(error), "text/plain")
+            return self.send(200, page, "text/html") if page else self.send(404, "没有这个文件", "text/plain")
+        if url.path == "/api/kb":
+            return self.send(200, kb_list())
+        if url.path.startswith("/api/kb/"):
+            try:
+                path = kb_path(url.path[len("/api/kb/"):])
+            except ValueError as error:
+                return self.send(400, {"error": str(error)})
+            return self.send(200, path.read_text(), "text/markdown") if path.exists() else self.send(404, {"error": "没有这个文件"})
         if url.path == "/api/nodes":
             return self.send(200, roster())
         if url.path == "/api/tasks":
@@ -528,6 +583,21 @@ class Handler(BaseHTTPRequestHandler):
                 task_id, action = match.groups()
                 return self.send(200, reply_task(task_id, data) if action == "reply" else stop_task(task_id))
             self.send(404, {"error": "not found"})
+        except ValueError as error:
+            self.send(400, {"error": str(error)})
+        except Exception as error:
+            self.send(500, {"error": str(error)})
+
+    def do_PUT(self):
+        try:
+            path = urlparse(self.path).path
+            if not path.startswith("/api/kb/"):
+                return self.send(404, {"error": "not found"})
+            text = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+            with lock:
+                written = kb_write(path[len("/api/kb/"):], text)
+            log(f"kb written: {written['path']}")
+            self.send(200, written)
         except ValueError as error:
             self.send(400, {"error": str(error)})
         except Exception as error:
@@ -585,6 +655,7 @@ class DualStackServer(ThreadingHTTPServer):
 def main():
     global SELF_SERVER
     (HOME / "tasks").mkdir(parents=True, exist_ok=True)
+    kb_dir().mkdir(parents=True, exist_ok=True)
     SELF_SERVER = own_server_id()
     resume()
     log(f"fleet registry on :{PORT}, data in {HOME}, self {SELF_SERVER}")
