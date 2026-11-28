@@ -4,7 +4,8 @@
 Keeps who is in the fleet and how to reach each machine's Paseo daemon, and
 records every task sent through it as one Markdown file. Dispatch itself is
 Paseo: the hub creates an agent on the target daemon with that machine's
-default agent and writes the result back into the task file.
+default agent, writes the result back into the task file, and can carry on
+the same conversation (reply) or stop it.
 
 Standard library only. Data lives in $FLEET_HOME (default ~/fleet).
 """
@@ -13,7 +14,6 @@ import html
 import json
 import os
 import re
-import shlex
 import socket
 import subprocess
 import sys
@@ -29,13 +29,15 @@ HOME = Path(os.environ.get("FLEET_HOME", Path.home() / "fleet")).expanduser()
 PORT = int(os.environ.get("FLEET_PORT", "6780"))
 PASEO = os.environ.get("FLEET_PASEO", "paseo")
 OFFLINE_AFTER = 6 * 60
-EDGE_EVERY = 60
 POLL_EVERY = 20
 TASK_LIMIT = 6 * 60 * 60
-DONE = {"done", "failed"}
+SILENT_GRACE = 5 * 60
+DONE = {"done", "failed", "stopped"}
+NO_RESULT = "（还没完成）"
 
 lock = threading.RLock()
 running = set()
+SELF_SERVER = None
 
 
 def now():
@@ -77,17 +79,6 @@ def own_server_id():
         return None
 
 
-SELF_SERVER = None
-
-
-def reachable(ip, port):
-    try:
-        with socket.create_connection((ip, port), timeout=1.5):
-            return True
-    except OSError:
-        return False
-
-
 def direct_endpoint(info):
     """A daemon listening beyond localhost is dialled directly when the hub can reach it."""
     listen = info.get("listen") or ""
@@ -97,30 +88,30 @@ def direct_endpoint(info):
     for ip in info.get("ips") or []:
         if ":" in ip:
             continue
-        if reachable(ip, port):
-            return f"{ip}:{port}"
+        try:
+            with socket.create_connection((ip, port), timeout=1.5):
+                return f"{ip}:{port}"
+        except OSError:
+            continue
     return None
 
 
-def merge_report(node, info):
-    keep = ("node_id", "name", "role", "joined_at", "ssh")
+def merge_report(node, info, direct):
     for key, value in info.items():
-        if key not in keep:
+        if key not in ("node_id", "name", "joined_at"):
             node[key] = value
     node["last_seen"] = time.time()
     if SELF_SERVER and node.get("server_id") == SELF_SERVER:
         node["endpoint"], node["via"] = None, "local"
+    elif direct:
+        node["endpoint"], node["via"] = direct, "direct"
     else:
-        direct = direct_endpoint(node)
-        if direct:
-            node["endpoint"], node["via"] = direct, "direct"
-        else:
-            node["endpoint"], node["via"] = node.get("pairing_url"), "relay"
+        node["endpoint"], node["via"] = node.get("pairing_url"), "relay"
     return node
 
 
 def public_node(node):
-    view = {k: v for k, v in node.items() if k != "pairing_url"}
+    view = {k: v for k, v in node.items() if k not in ("pairing_url", "role", "ssh")}
     seen = node.get("last_seen") or 0
     view["online"] = time.time() - seen < OFFLINE_AFTER
     view["last_seen_at"] = stamp(datetime.fromtimestamp(seen).astimezone()) if seen else None
@@ -134,9 +125,16 @@ def roster():
         return [public_node(n) for n in sorted(load_nodes().values(), key=lambda n: n["name"])]
 
 
-# ---- tasks ---------------------------------------------------------------
+# ---- task files ------------------------------------------------------------
+#
+# ---
+# id / title / from / to / agent / status / created / started / finished / rounds / cwd / paseo_agent
+# ---
+# ## 任务        what was asked first
+# ## 往来        follow-ups and earlier results, oldest first (only after a reply)
+# ## 结果        the latest result
 
-FIELDS = ["id", "title", "from", "to", "agent", "status", "created", "started", "finished", "cwd", "paseo_agent"]
+FIELDS = ["id", "title", "from", "to", "agent", "status", "created", "started", "finished", "rounds", "cwd", "paseo_agent"]
 
 
 def tasks_dir():
@@ -176,20 +174,22 @@ def read_task(path):
         for line in head.splitlines():
             key, _, value = line.partition(":")
             meta[key.strip()] = value.strip()
-    # Only our two headings split the body; the agent's own "## " lines stay in its result.
-    task, _, result = body.partition("\n## 结果\n")
+    # Only our headings split the body; the agent's own "## " lines stay where they are.
+    before, _, result = body.partition("\n## 结果\n")
+    task, _, history = before.partition("\n## 往来\n")
     meta["prompt"] = task.split("## 任务\n", 1)[-1].strip()
+    meta["history"] = history.strip()
     meta["result"] = result.strip()
     meta["path"] = str(path)
     return meta
 
 
 def write_task(path, meta):
-    lines = ["---"]
-    for key in FIELDS:
-        value = str(meta.get(key) or "").replace("\n", " ")
-        lines.append(f"{key}: {value}")
-    lines += ["---", "## 任务", "", meta.get("prompt", "").strip(), "", "## 结果", "", (meta.get("result") or "（还没完成）").strip(), ""]
+    lines = ["---"] + [f"{key}: {str(meta.get(key) or '').replace(chr(10), ' ')}" for key in FIELDS] + ["---"]
+    lines += ["## 任务", "", meta.get("prompt", "").strip(), ""]
+    if meta.get("history"):
+        lines += ["## 往来", "", meta["history"].strip(), ""]
+    lines += ["## 结果", "", (meta.get("result") or NO_RESULT).strip(), ""]
     tmp = path.with_suffix(".tmp")
     tmp.write_text("\n".join(lines))
     tmp.replace(path)
@@ -201,6 +201,16 @@ def update_task(path, **changes):
         meta.update(changes)
         write_task(path, meta)
         return meta
+
+
+def parse_agent(text):
+    provider, _, model = text.partition("/")
+    return {"provider": provider, **({"model": model} if model else {})}
+
+
+def format_agent(agent):
+    text = agent.get("provider", "") + (f"/{agent['model']}" if agent.get("model") else "")
+    return text + (f" ({agent['mode']})" if agent.get("mode") else "")
 
 
 def create_task(data):
@@ -217,14 +227,13 @@ def create_task(data):
         agent = parse_agent(agent)
     task_id = next_id()
     title = (data.get("title") or prompt.splitlines()[0])[:60]
-    day = now().strftime("%Y-%m-%d")
-    folder = tasks_dir() / day
+    folder = tasks_dir() / now().strftime("%Y-%m-%d")
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{task_id:04d}-{target}-{slug(title)}.md"
     meta = {
         "id": task_id, "title": title, "from": data.get("from") or "unknown", "to": target,
-        "agent": format_agent(agent), "status": "queued", "created": stamp(), "prompt": prompt,
-        "cwd": data.get("cwd") or node.get("cwd") or "",
+        "agent": format_agent(agent), "status": "queued", "created": stamp(), "rounds": 1,
+        "cwd": data.get("cwd") or node.get("cwd") or "", "prompt": prompt,
     }
     with lock:
         write_task(path, meta)
@@ -233,21 +242,40 @@ def create_task(data):
     return read_task(path)
 
 
-def parse_agent(text):
-    parts = text.split("/", 1)
-    agent = {"provider": parts[0]}
-    if len(parts) > 1:
-        agent["model"] = parts[1]
-    return agent
+def reply_task(task_id, data):
+    path = find_task(task_id)
+    prompt = (data.get("prompt") or "").strip()
+    if not path or not prompt:
+        raise ValueError("没有这个任务，或者追问内容是空的")
+    with lock:
+        meta = read_task(path)
+        if not meta.get("paseo_agent"):
+            raise ValueError("这个任务还没派出去，不能追问")
+        if meta.get("status") not in DONE:
+            raise ValueError("它还在干，等干完再追问，或者先 fleet stop")
+        rounds = int(meta.get("rounds") or 1)
+        earlier = meta.get("history", "")
+        if meta.get("result") and meta["result"] != NO_RESULT:
+            earlier += f"\n\n### 第 {rounds} 轮结果\n\n{meta['result']}"
+        earlier += f"\n\n### 追问 · {stamp()} · {data.get('from') or 'unknown'}\n\n{prompt}"
+        update_task(path, history=earlier.strip(), result="", status="running", finished="", rounds=rounds + 1)
+    log(f"task #{task_id} reply from {data.get('from')}")
+    start_worker(path, reply=prompt)
+    return read_task(path)
 
 
-def format_agent(agent):
-    text = agent.get("provider", "")
-    if agent.get("model"):
-        text += "/" + agent["model"]
-    if agent.get("mode"):
-        text += f" ({agent['mode']})"
-    return text
+def stop_task(task_id):
+    path = find_task(task_id)
+    if not path:
+        raise ValueError("没有这个任务")
+    meta = read_task(path)
+    if meta.get("status") in DONE:
+        return meta
+    node = load_nodes().get(meta["to"]) or {}
+    if meta.get("paseo_agent"):
+        paseo(["stop", meta["paseo_agent"]], node.get("endpoint"))
+    log(f"task #{task_id} stopped")
+    return update_task(path, status="stopped", finished=stamp(), result=(meta.get("result") if meta.get("result") != NO_RESULT else "") or "被叫停")
 
 
 def list_tasks(query):
@@ -257,7 +285,8 @@ def list_tasks(query):
         meta = read_task(path)
         if any(query.get(key) and meta.get(key) != query[key][0] for key in ("to", "from", "status")):
             continue
-        meta.pop("prompt", None)
+        for key in ("prompt", "history"):
+            meta.pop(key, None)
         meta["result"] = meta.get("result", "")[:200]
         items.append(meta)
         if len(items) >= limit:
@@ -275,26 +304,31 @@ def paseo(args, endpoint, timeout=120):
     return json.loads(result.stdout) if result.stdout.strip().startswith(("{", "[")) else result.stdout
 
 
-def last_reply(agent_id, endpoint):
+def replies(agent_id, endpoint):
     logs = paseo(["logs", agent_id, "--json"], endpoint)
-    for item in reversed(logs.get("items", [])):
-        if item.get("type") == "assistant_message" and item.get("text", "").strip():
-            return item["text"].strip()
-    return None
+    return [i["text"].strip() for i in logs.get("items", []) if i.get("type") == "assistant_message" and i.get("text", "").strip()]
 
 
-def start_worker(path):
+def start_worker(path, reply=None):
     key = str(path)
-    with lock:
-        if key in running:
-            return
-        running.add(key)
-    threading.Thread(target=work, args=(path,), daemon=True).start()
+    # A reply can land just after the last round was marked done, while its
+    # worker is still on the way out; give that worker a moment to leave.
+    for _ in range(50 if reply else 1):
+        with lock:
+            if key not in running:
+                running.add(key)
+                break
+        time.sleep(0.2)
+    else:
+        if reply:
+            update_task(path, status="failed", finished=stamp(), result="追问没发出去：上一轮还没收尾，稍后再试")
+        return
+    threading.Thread(target=work, args=(path, reply), daemon=True).start()
 
 
-def work(path):
+def work(path, reply=None):
+    meta = read_task(path)
     try:
-        meta = read_task(path)
         with lock:
             node = load_nodes().get(meta["to"])
         if not node:
@@ -305,6 +339,7 @@ def work(path):
             update_task(path, status="failed", finished=stamp(), result="还不知道怎么连这台机器（没有上报过配对链接）")
             return
         agent_id = meta.get("paseo_agent")
+        baseline = None  # assistant messages before this round; unknown when resuming after a restart
         if not agent_id:
             agent = parse_agent(meta["agent"].split(" (")[0]) if meta.get("agent") else {}
             mode = re.search(r"\((.+)\)$", meta.get("agent", ""))
@@ -314,20 +349,22 @@ def work(path):
             )
             args = ["run", "--no-wait", "--json", "--title", f"#{meta['id']} {meta['title']}"[:60],
                     "--cwd", meta.get("cwd") or node.get("cwd") or "/tmp", "--label", f"fleet_task={meta['id']}"]
-            if agent.get("provider"):
-                args += ["--provider", agent["provider"]]
-            if agent.get("model"):
-                args += ["--model", agent["model"]]
-            if mode:
-                args += ["--mode", mode.group(1)]
-            created = paseo(args + [prompt], endpoint, timeout=180)
-            agent_id = created["agentId"]
+            args += ["--provider", agent["provider"]] if agent.get("provider") else []
+            args += ["--model", agent["model"]] if agent.get("model") else []
+            args += ["--mode", mode.group(1)] if mode else []
+            agent_id = paseo(args + [prompt], endpoint, timeout=180)["agentId"]
+            baseline = 0
             update_task(path, status="running", started=stamp(), paseo_agent=agent_id)
             log(f"task #{meta['id']} running on {meta['to']} as {agent_id}")
+        elif reply:
+            baseline = len(replies(agent_id, endpoint))
+            paseo(["send", agent_id, "--behavior", "queue", "--no-wait", "--prompt",
+                   f"[机群任务 #{meta['id']} 追问]\n\n{reply}\n\n---\n干完后最后一条消息照样写清楚结果。"], endpoint, timeout=180)
         begun = time.time()
-        deadline = begun + TASK_LIMIT
-        while time.time() < deadline:
+        while time.time() - begun < TASK_LIMIT:
             time.sleep(POLL_EVERY)
+            if read_task(path).get("status") == "stopped":
+                return
             try:
                 state = paseo(["inspect", agent_id, "--json"], endpoint)
             except Exception as error:
@@ -335,21 +372,23 @@ def work(path):
                 continue
             status = (state.get("Status") or "").lower()
             if status in ("idle", "error", "closed"):
-                result = last_reply(agent_id, endpoint)
-                # Idle before saying anything usually means it has not started yet.
-                if status == "idle" and result is None and time.time() - begun < 120:
+                said = replies(agent_id, endpoint)
+                fresh = len(said) > baseline if baseline is not None else bool(said)
+                # Idle with nothing new usually means this round has not started yet.
+                if status == "idle" and not fresh and time.time() - begun < SILENT_GRACE:
                     continue
                 final = "done" if status == "idle" else "failed"
-                update_task(path, status=final, finished=stamp(), result=result or "（Agent 没有留下文字结果，去 Paseo 里看过程）")
+                result = said[-1] if fresh else "（这一轮没有留下文字结果，去 Paseo 里看过程）"
+                update_task(path, status=final, finished=stamp(), result=result)
                 log(f"task #{meta['id']} {final}")
                 return
-            pending = "blocked" if state.get("PendingPermissions") else "running"
-            if read_task(path).get("status") != pending:
-                update_task(path, status=pending)
+            current = "blocked" if state.get("PendingPermissions") else "running"
+            if read_task(path).get("status") != current:
+                update_task(path, status=current)
         update_task(path, status="failed", finished=stamp(), result="超过 6 小时没有结束，中心不再等待；Agent 可能还在跑，去 Paseo 里看")
     except Exception as error:
         update_task(path, status="failed", finished=stamp(), result=f"派活失败：{error}")
-        log(f"task {path.name} failed: {error}")
+        log(f"task #{meta.get('id')} failed: {error}")
     finally:
         with lock:
             running.discard(str(path))
@@ -357,61 +396,13 @@ def work(path):
 
 def resume():
     for path in task_files():
-        meta = read_task(path)
-        if meta.get("status") not in DONE:
+        if read_task(path).get("status") not in DONE:
             start_worker(path)
-
-
-# ---- edges: reachable from the hub, cannot reach it ------------------------
-
-def ssh(node, command, data=None, timeout=60):
-    return subprocess.run(shlex.split(node["ssh"]) + [command], input=data, capture_output=True, timeout=timeout,
-                          text=isinstance(data, str) or data is None)
-
-
-FLEET_BIN = 'python3 "$HOME/.local/lib/fleet/fleet"'
-
-
-def sync_edge(node):
-    report = ssh(node, f"{FLEET_BIN} report --stdout")
-    if report.returncode != 0:
-        log(f"edge {node['name']} unreachable: {report.stderr.strip()[:200]}")
-        return
-    with lock:
-        nodes = load_nodes()
-        merge_report(nodes[node["name"]], json.loads(report.stdout))
-        save_nodes(nodes)
-    ssh(node, 'mkdir -p "$HOME/fleet" && cat > "$HOME/fleet/roster.json"', json.dumps(roster(), ensure_ascii=False))
-    drained = ssh(node, f"{FLEET_BIN} outbox --drain")
-    if drained.returncode == 0 and drained.stdout.strip():
-        for item in json.loads(drained.stdout):
-            item["from"] = item.get("from") or node["name"]
-            try:
-                create_task(item)
-            except ValueError as error:
-                log(f"edge {node['name']} task rejected: {error}")
-    mine = [p for p in task_files() if read_task(p).get("from", "").split("/")[0] == node["name"]]
-    if mine:
-        names = [str(p.relative_to(tasks_dir())) for p in mine[:200]]
-        archive = subprocess.run(["tar", "-C", str(tasks_dir()), "-cf", "-"] + names, capture_output=True).stdout
-        ssh(node, 'mkdir -p "$HOME/fleet/tasks" && tar -C "$HOME/fleet/tasks" -xf -', archive)
-
-
-def edge_loop():
-    while True:
-        with lock:
-            edges = [n for n in load_nodes().values() if n.get("role") == "edge" and n.get("ssh")]
-        for node in edges:
-            try:
-                sync_edge(node)
-            except Exception as error:
-                log(f"edge {node['name']} sync failed: {error}")
-        time.sleep(EDGE_EVERY)
 
 
 # ---- http ----------------------------------------------------------------
 
-STATUS_LABELS = {"queued": "排队", "running": "进行中", "blocked": "等审批", "done": "完成", "failed": "失败"}
+STATUS_LABELS = {"queued": "排队", "running": "进行中", "blocked": "等审批", "done": "完成", "failed": "失败", "stopped": "已叫停"}
 
 PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <meta http-equiv=refresh content=30><title>机群</title><style>
@@ -428,11 +419,11 @@ nav a{margin-right:12px}</style>"""
 def render_index(query):
     rows = []
     for n in roster():
-        agent = n.get("agent") or {}
+        labels = " ".join(f"{k}={v}" for k, v in (n.get("labels") or {}).items())
         rows.append(
             f"<tr><td><span class='dot {'on' if n['online'] else 'off'}'></span>{html.escape(n['name'])}</td>"
-            f"<td>{html.escape(n.get('role', 'node'))}</td><td>{html.escape(format_agent(agent))}</td>"
-            f"<td>{html.escape(n.get('via') or '')}</td><td class=muted>{html.escape(', '.join(n.get('ips') or []))}</td>"
+            f"<td>{html.escape(format_agent(n.get('agent') or {}))}</td><td>{html.escape(n.get('via') or '')}</td>"
+            f"<td class=muted>{html.escape(', '.join(n.get('ips') or []))}</td><td class=muted>{html.escape(labels)}</td>"
             f"<td class=muted>{html.escape(n.get('last_seen_at') or '从未')}</td><td>{n.get('running', '')}</td></tr>")
     tasks = []
     for t in list_tasks(query):
@@ -442,7 +433,7 @@ def render_index(query):
             f"<td>{html.escape(t.get('from', ''))} → <a href='/?to={html.escape(t.get('to', ''))}'>{html.escape(t.get('to', ''))}</a></td>"
             f"<td>{html.escape(t.get('title', ''))}</td><td><a class='chip {status}' href='/?status={status}'>{STATUS_LABELS.get(status, status)}</a></td></tr>")
     filters = " · ".join(f"{k}={v[0]}" for k, v in query.items() if k in ("to", "from", "status"))
-    return (PAGE + "<h2>机器</h2><table><tr><th>名字</th><th>角色</th><th>默认 Agent</th><th>连法</th><th>IP</th><th>最近心跳</th><th>在跑</th></tr>"
+    return (PAGE + "<h2>机器</h2><table><tr><th>名字</th><th>默认 Agent</th><th>连法</th><th>IP</th><th>标签</th><th>最近心跳</th><th>在跑</th></tr>"
             + "".join(rows) + "</table>"
             + f"<h2>派活 {('· 筛选 ' + html.escape(filters) + ' <a href=/>清除</a>') if filters else ''}</h2>"
             + "<table><tr><th>编号</th><th>时间</th><th>谁 → 谁</th><th>任务</th><th>状态</th></tr>" + "".join(tasks) + "</table>")
@@ -460,7 +451,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def send(self, code, body, kind="application/json"):
-        data = body if isinstance(body, bytes) else (json.dumps(body, ensure_ascii=False) if kind == "application/json" else body).encode()
+        data = (json.dumps(body, ensure_ascii=False) if kind == "application/json" else body).encode()
         self.send_response(code)
         self.send_header("Content-Type", f"{kind}; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -487,7 +478,7 @@ class Handler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/tasks/(\d+)", url.path)
         if match:
             path = find_task(match.group(1))
-            return self.send(200, read_task(path)) if path else self.send(404, {"error": "没有这个任务"})
+            return self.send(200, read_task(path) | {"text": path.read_text()}) if path else self.send(404, {"error": "没有这个任务"})
         self.send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -499,18 +490,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/heartbeat":
                 return self.heartbeat(data)
             if path == "/api/leave":
-                with lock:
-                    nodes = load_nodes()
-                    gone = [k for k, n in nodes.items() if n.get("node_id") == data.get("node_id")]
-                    for key in gone:
-                        del nodes[key]
-                    save_nodes(nodes)
-                log(f"left: {gone}")
-                return self.send(200, {"removed": gone})
-            if path == "/api/edges":
-                return self.edge(data)
+                return self.leave(data)
             if path == "/api/tasks":
                 return self.send(201, create_task(data))
+            match = re.fullmatch(r"/api/tasks/(\d+)/(reply|stop)", path)
+            if match:
+                task_id, action = match.groups()
+                return self.send(200, reply_task(task_id, data) if action == "reply" else stop_task(task_id))
             self.send(404, {"error": "not found"})
         except ValueError as error:
             self.send(400, {"error": str(error)})
@@ -521,40 +507,40 @@ class Handler(BaseHTTPRequestHandler):
         name = (data.get("name") or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}", name):
             raise ValueError("名字只能用字母、数字、点、横线、下划线，最长 32 个字符")
+        info = data.get("info") or {}
+        direct = direct_endpoint(info)  # dial outside the lock: it can take seconds
         with lock:
             nodes = load_nodes()
             known = nodes.get(name)
             if known and known.get("node_id") != data.get("node_id"):
                 raise ValueError(f"{name} 已经被另一台机器占用，换个名字")
-            node = known or {"name": name, "node_id": data.get("node_id") or uuid.uuid4().hex, "role": "node", "joined_at": stamp()}
-            nodes[name] = merge_report(node, data.get("info") or {})
+            node = known or {"name": name, "node_id": data.get("node_id") or uuid.uuid4().hex, "joined_at": stamp()}
+            nodes[name] = merge_report(node, info, direct)
             save_nodes(nodes)
         log(f"joined: {name}")
-        self.send(200, public_node(nodes[name]) | {"node_id": node["node_id"]})
+        self.send(200, public_node(node) | {"node_id": node["node_id"]})
 
     def heartbeat(self, data):
+        info = data.get("info") or {}
+        direct = direct_endpoint(info)
         with lock:
             nodes = load_nodes()
             node = next((n for n in nodes.values() if n.get("node_id") == data.get("node_id")), None)
             if not node:
                 return self.send(404, {"error": "中心不认识这台机器，重新 fleet join"})
-            merge_report(node, data.get("info") or {})
+            merge_report(node, info, direct)
             save_nodes(nodes)
         self.send(200, {"ok": True})
 
-    def edge(self, data):
-        name, target = (data.get("name") or "").strip(), (data.get("ssh") or "").strip()
-        if not name or not target:
-            raise ValueError("name 和 ssh 都要填")
+    def leave(self, data):
         with lock:
             nodes = load_nodes()
-            node = nodes.get(name) or {"name": name, "node_id": uuid.uuid4().hex, "joined_at": stamp()}
-            node.update(role="edge", ssh=target)
-            nodes[name] = node
+            gone = [k for k, n in nodes.items() if n.get("node_id") == data.get("node_id")]
+            for key in gone:
+                del nodes[key]
             save_nodes(nodes)
-        threading.Thread(target=sync_edge, args=(node,), daemon=True).start()
-        log(f"edge added: {name} via {target}")
-        self.send(200, public_node(node))
+        log(f"left: {gone}")
+        self.send(200, {"removed": gone})
 
 
 class DualStackServer(ThreadingHTTPServer):
@@ -571,7 +557,6 @@ def main():
     (HOME / "tasks").mkdir(parents=True, exist_ok=True)
     SELF_SERVER = own_server_id()
     resume()
-    threading.Thread(target=edge_loop, daemon=True).start()
     log(f"fleet registry on :{PORT}, data in {HOME}, self {SELF_SERVER}")
     DualStackServer(("::", PORT), Handler).serve_forever()
 

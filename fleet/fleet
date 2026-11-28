@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """fleet: one command on every machine of the fleet.
 
-  fleet join HUB --name NAME --agent PROVIDER/MODEL [--mode MODE] [--edge]
+  fleet join HUB --name NAME --agent PROVIDER/MODEL [--mode MODE]
   fleet leave
   fleet nodes                      who is in the fleet, online or not
   fleet run NODE "task" [--wait]   send a task through the hub (use - to read stdin)
+  fleet reply ID "more" [--wait]   carry on the same task with the same agent
+  fleet stop ID                    stop a task that is still running
   fleet ls [--to N] [--status S]   tasks sent through the hub
-  fleet show ID                    one task, with its result
-  fleet report [--stdout]          heartbeat (cron / launchd run this)
-  fleet outbox --drain             edge only: hand queued tasks to the hub
+  fleet show ID                    one task: what was asked, the back and forth, the result
+  fleet report                     heartbeat (cron / launchd run this every 2 minutes)
 
-Standard library only. Config: ~/.config/fleet/node.json. Data: ~/fleet.
+Standard library only. Config: ~/.config/fleet/node.json. Work dir: ~/fleet/work.
 """
 
 import argparse
@@ -199,37 +200,45 @@ def remove_timer():
     subprocess.run(["crontab", "-"], input="\n".join(kept) + ("\n" if kept else ""), text=True)
 
 
+def sender(config, explicit=None):
+    # From inside a Paseo agent, record which agent it was.
+    agent_id = os.environ.get("PASEO_AGENT_ID", "")[:8]
+    return explicit or (f"{config['name']}/{agent_id}" if agent_id else config["name"])
+
+
+def wait_for(config, task_id):
+    while True:
+        time.sleep(15)
+        task = call_hub(config, "GET", f"/api/tasks/{task_id}")
+        if task["status"] in ("done", "failed", "stopped"):
+            print(f"\n[{task['status']}]\n{task['result']}")
+            return
+
+
 def cmd_join(args):
     old = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
     config = {
         "node_id": old.get("node_id") if old.get("name") == args.name else uuid.uuid4().hex,
         "name": args.name,
         "hub": args.hub.rstrip("/"),
-        "role": "edge" if args.edge else "node",
         "agent": parse_agent(args.agent, args.mode),
         "labels": dict(label.split("=", 1) for label in args.label),
-        "paseo": find_paseo(),
+        "paseo": args.paseo or find_paseo(),
         "path": PATH_HINTS,
     }
-    for folder in ("work", "outbox", "tasks"):
-        (DATA / folder).mkdir(parents=True, exist_ok=True)
+    (DATA / "work").mkdir(parents=True, exist_ok=True)
     save_config(config)
-    link_skill()
-    if args.edge:
-        print(f"{args.name} 以边缘节点加入：它连不到中心，由中心通过 SSH 来取上报和待发任务。")
-        print(f"在中心上执行：fleet edge-add {args.name} --ssh 'ssh -o BatchMode=yes <从中心登录这台的地址>'")
-        return
     joined = call_hub(config, "POST", "/api/join", {"name": args.name, "node_id": config["node_id"], "info": gather(config)})
     config["node_id"] = joined["node_id"]
     save_config(config)
+    link_skill()
     timer = install_timer()
-    print(f"{args.name} 已加入 {config['hub']}，连法：{joined.get('via')}，默认 Agent：{args.agent}，心跳：{timer}")
+    print(f"{args.name} 已加入 {config['hub']}，中心连它的方式：{joined.get('via')}，默认 Agent：{args.agent}，心跳：{timer}")
 
 
 def cmd_leave(args):
     config = load_config()
-    if config.get("role") != "edge":
-        call_hub(config, "POST", "/api/leave", {"node_id": config["node_id"]})
+    call_hub(config, "POST", "/api/leave", {"node_id": config["node_id"]})
     remove_timer()
     unlink_skill()
     CONFIG.unlink()
@@ -243,22 +252,11 @@ def cmd_report(args):
         print(json.dumps(info, ensure_ascii=False))
         return
     call_hub(config, "POST", "/api/heartbeat", {"node_id": config["node_id"], "info": info})
-    roster = call_hub(config, "GET", "/api/nodes")
-    (DATA / "roster.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2))
-
-
-def roster(config):
-    if config.get("role") == "edge":
-        try:
-            return json.loads((DATA / "roster.json").read_text())
-        except FileNotFoundError:
-            fail("中心还没把通讯录推过来")
-    return call_hub(config, "GET", "/api/nodes")
 
 
 def cmd_nodes(args):
     config = load_config()
-    nodes = roster(config)
+    nodes = call_hub(config, "GET", "/api/nodes")
     if args.json:
         print(json.dumps(nodes, ensure_ascii=False, indent=2))
         return
@@ -268,42 +266,40 @@ def cmd_nodes(args):
         me = " ← 本机" if n["name"] == config["name"] else ""
         state = "在线" if n.get("online") else "离线"
         labels = " ".join(f"{k}={v}" for k, v in (n.get("labels") or {}).items())
-        print(f"{n['name']:<10} {state}  {n.get('role', 'node'):<5} {model:<28} {n.get('via') or '-':<7} 在跑 {n.get('running', 0)}  {labels}{me}")
+        print(f"{n['name']:<10} {state}  {model:<28} {n.get('via') or '-':<7} 在跑 {n.get('running', 0)}  {labels}{me}")
 
 
 def cmd_run(args):
     config = load_config()
     prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
-    # From inside a Paseo agent, record which agent sent it.
-    agent_id = os.environ.get("PASEO_AGENT_ID", "")[:8]
-    sender = args.sender or (f"{config['name']}/{agent_id}" if agent_id else config["name"])
-    task = {"from": sender, "to": args.node, "prompt": prompt, "title": args.title}
+    task = {"from": sender(config, args.sender), "to": args.node, "prompt": prompt, "title": args.title}
     if args.agent:
         task["agent"] = parse_agent(args.agent, args.mode)
     if args.cwd:
         task["cwd"] = args.cwd
-    if config.get("role") == "edge":
-        path = DATA / "outbox" / f"{int(time.time() * 1000)}.json"
-        path.write_text(json.dumps(task, ensure_ascii=False))
-        print(f"已放进待发箱，中心约 1 分钟内取走：{path}")
-        return
     created = call_hub(config, "POST", "/api/tasks", task)
     print(f"#{created['id']} 已派给 {args.node}（{created['agent']}），记录：{created['path']}")
     if args.wait:
-        while True:
-            time.sleep(15)
-            task = call_hub(config, "GET", f"/api/tasks/{created['id']}")
-            if task["status"] in ("done", "failed"):
-                print(f"\n[{task['status']}]\n{task['result']}")
-                return
+        wait_for(config, created["id"])
+
+
+def cmd_reply(args):
+    config = load_config()
+    prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
+    task = call_hub(config, "POST", f"/api/tasks/{args.id}/reply", {"from": sender(config), "prompt": prompt})
+    print(f"#{task['id']} 第 {task['rounds']} 轮已发给 {task['to']} 上原来那个 Agent")
+    if args.wait:
+        wait_for(config, task["id"])
+
+
+def cmd_stop(args):
+    config = load_config()
+    task = call_hub(config, "POST", f"/api/tasks/{args.id}/stop", {})
+    print(f"#{task['id']} {task['status']}")
 
 
 def cmd_ls(args):
     config = load_config()
-    if config.get("role") == "edge":
-        for path in sorted((DATA / "tasks").glob("*/*.md"), reverse=True)[: args.n]:
-            print(path)
-        return
     query = "&".join(f"{k}={v}" for k, v in (("to", args.to), ("from", args.sender), ("status", args.status)) if v)
     for t in call_hub(config, "GET", f"/api/tasks?limit={args.n}&{query}"):
         print(f"#{t['id']:<5} {t['created']}  {t['from']} → {t['to']:<8} {t['status']:<8} {t['title']}")
@@ -311,46 +307,26 @@ def cmd_ls(args):
 
 def cmd_show(args):
     config = load_config()
-    if config.get("role") == "edge":
-        matches = list((DATA / "tasks").glob(f"*/{int(args.id):04d}-*.md"))
-        print(matches[0].read_text() if matches else "还没同步到这个任务")
-        return
-    task = call_hub(config, "GET", f"/api/tasks/{args.id}")
-    print(Path(task["path"]).read_text() if Path(task["path"]).exists() else json.dumps(task, ensure_ascii=False, indent=2))
-
-
-def cmd_outbox(args):
-    items = []
-    for path in sorted((DATA / "outbox").glob("*.json")):
-        items.append(json.loads(path.read_text()))
-        if args.drain:
-            path.unlink()
-    print(json.dumps(items, ensure_ascii=False))
-
-
-def cmd_edge_add(args):
-    config = load_config()
-    node = call_hub(config, "POST", "/api/edges", {"name": args.name, "ssh": args.ssh})
-    print(f"{node['name']} 已登记为边缘节点，中心每分钟通过 SSH 同步一次")
+    print(call_hub(config, "GET", f"/api/tasks/{args.id}")["text"])
 
 
 def main():
     parser = argparse.ArgumentParser(prog="fleet", description="机群：查看机器、派活、看记录")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("join", help="加入机群")
+    p = sub.add_parser("join", help="加入机群（再次执行同一个名字＝更新配置）")
     p.add_argument("hub", help="中心地址，如 http://10.0.0.1:6780")
     p.add_argument("--name", required=True)
     p.add_argument("--agent", required=True, help="默认 Agent，provider/model，如 traecli/gpt-6.2-sol/high")
     p.add_argument("--mode", help="默认权限模式，如 bypass_permissions、full-access")
     p.add_argument("--label", action="append", default=[], help="k=v，可重复")
-    p.add_argument("--edge", action="store_true", help="连不到中心的机器")
+    p.add_argument("--paseo", help="paseo 命令的完整路径（不在常见位置时）")
     p.set_defaults(func=cmd_join)
 
     sub.add_parser("leave", help="离开机群").set_defaults(func=cmd_leave)
 
-    p = sub.add_parser("report", help="上报心跳")
-    p.add_argument("--stdout", action="store_true")
+    p = sub.add_parser("report", help="上报心跳（定时器在跑）")
+    p.add_argument("--stdout", action="store_true", help="只打印要上报的内容")
     p.set_defaults(func=cmd_report)
 
     p = sub.add_parser("nodes", help="机器列表")
@@ -363,10 +339,20 @@ def main():
     p.add_argument("--title")
     p.add_argument("--agent", help="不用对方的默认 Agent 时指定 provider/model")
     p.add_argument("--mode")
-    p.add_argument("--cwd", help="对方机器上的工作目录")
+    p.add_argument("--cwd", help="对方机器上的工作目录，默认 ~/fleet/work")
     p.add_argument("--from", dest="sender", help="记录里的派活人，默认本机名")
     p.add_argument("--wait", action="store_true", help="等到干完再返回")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("reply", help="对派出去的活追问（同一个 Agent 接着干）")
+    p.add_argument("id")
+    p.add_argument("prompt", help="追问内容；写 - 从标准输入读")
+    p.add_argument("--wait", action="store_true")
+    p.set_defaults(func=cmd_reply)
+
+    p = sub.add_parser("stop", help="叫停一个正在干的活")
+    p.add_argument("id")
+    p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("ls", help="派活记录")
     p.add_argument("--to")
@@ -375,18 +361,9 @@ def main():
     p.add_argument("-n", type=int, default=20)
     p.set_defaults(func=cmd_ls)
 
-    p = sub.add_parser("show", help="看一条派活")
+    p = sub.add_parser("show", help="看一条派活的完整记录")
     p.add_argument("id")
     p.set_defaults(func=cmd_show)
-
-    p = sub.add_parser("outbox", help="边缘节点的待发箱")
-    p.add_argument("--drain", action="store_true")
-    p.set_defaults(func=cmd_outbox)
-
-    p = sub.add_parser("edge-add", help="在中心登记一台边缘节点")
-    p.add_argument("name")
-    p.add_argument("--ssh", required=True, help="中心登录它的 ssh 命令")
-    p.set_defaults(func=cmd_edge_add)
 
     args = parser.parse_args()
     args.func(args)
