@@ -6,6 +6,7 @@
 |---|---|---|---|
 | `paseo-bb-queue/` | `bb-queue` | 两种服务端排队：`bb ` 前缀在主 agent 及其子 agent 都空闲后发下一条；`cc ` 前缀按设置的分钟间隔定时发（积压时仍保持间隔）。两者共用一把发送锁，bb 优先；上一轮失败时都先停下，之后某一轮成功（如自动重试）就自动恢复。等子 agent 最长 60 分钟（可设置，0 为不限） | `paseo-bb-queue/plugin` |
 | `paseo-auto-retry/` | `auto-retry` | 因超时、网络、限流或 provider 临时错误中断的轮次自动重试，每个请求最多 3 次 | `paseo-auto-retry` |
+| `fleet/` | —（不是插件） | 机群：中心登记各机器的 Paseo、通过中心给任意机器的默认 Agent 派活、每个活记成一个 Markdown 文件，详见 `fleet/README.md` | — |
 | `paseo-unread-count/` | `unread-count` | 侧边栏顶部显示所有已连接主机上完成/出错/等审批未看的会话数 | `paseo-unread-count` |
 
 ## 新机器安装

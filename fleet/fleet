@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""fleet: one command on every machine of the fleet.
+
+  fleet join HUB --name NAME --agent PROVIDER/MODEL [--mode MODE] [--edge]
+  fleet leave
+  fleet nodes                      who is in the fleet, online or not
+  fleet run NODE "task" [--wait]   send a task through the hub (use - to read stdin)
+  fleet ls [--to N] [--status S]   tasks sent through the hub
+  fleet show ID                    one task, with its result
+  fleet report [--stdout]          heartbeat (cron / launchd run this)
+  fleet outbox --drain             edge only: hand queued tasks to the hub
+
+Standard library only. Config: ~/.config/fleet/node.json. Data: ~/fleet.
+"""
+
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONFIG = Path.home() / ".config" / "fleet" / "node.json"
+DATA = Path.home() / "fleet"
+SKILL_DIRS = [".agents/skills", ".claude/skills", ".codex/skills", ".trae/skills"]
+PATH_HINTS = ["~/.local/node/bin", "~/.local/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+CRON_TAG = "# fleet-report"
+LAUNCHD = Path.home() / "Library" / "LaunchAgents" / "com.fleet.report.plist"
+
+
+def fail(message):
+    print(f"fleet: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_config():
+    try:
+        return json.loads(CONFIG.read_text())
+    except FileNotFoundError:
+        fail("这台机器还没加入机群，先 fleet join")
+
+
+def save_config(config):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2))
+
+
+def env_with_path(config=None):
+    env = dict(os.environ)
+    extra = [os.path.expanduser(p) for p in (config or {}).get("path", PATH_HINTS)]
+    env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
+    return env
+
+
+def call_hub(config, method, path, body=None, timeout=20):
+    request = urllib.request.Request(config["hub"].rstrip("/") + path, method=method,
+                                     data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read() or b"null")
+    except urllib.error.HTTPError as error:
+        try:
+            message = json.loads(error.read()).get("error")
+        except Exception:
+            message = str(error)
+        fail(message)
+    except OSError as error:
+        fail(f"连不上中心 {config['hub']}：{error}")
+
+
+# ---- what this machine looks like -----------------------------------------
+
+def paseo_json(config, *args):
+    try:
+        out = subprocess.run([config.get("paseo", "paseo"), *args, "--json"], capture_output=True, text=True,
+                             timeout=60, env=env_with_path(config)).stdout
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def addresses():
+    found = []
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(["ifconfig"], capture_output=True, text=True).stdout
+            found = re.findall(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+        else:
+            found = subprocess.run(["hostname", "-I"], capture_output=True, text=True).stdout.split()
+    except Exception:
+        pass
+    return [ip for ip in found if not ip.startswith("127.")]
+
+
+def gather(config):
+    status = paseo_json(config, "status") or {}
+    agents = paseo_json(config, "ls") or []
+    if config.get("pairing_server") != status.get("serverId"):
+        pair = paseo_json(config, "daemon", "pair") or {}
+        config["pairing_url"], config["pairing_server"] = pair.get("url"), status.get("serverId")
+        save_config(config)
+    return {
+        "hostname": socket.gethostname(),
+        "platform": f"{platform.system()} {platform.machine()}",
+        "ips": addresses(),
+        "listen": status.get("listen"),
+        "server_id": status.get("serverId"),
+        "paseo_version": status.get("daemonVersion"),
+        "providers": [p["provider"] for p in status.get("providers", []) if p.get("available")],
+        "pairing_url": config.get("pairing_url"),
+        "agent": config.get("agent"),
+        "cwd": str(DATA / "work"),
+        "labels": config.get("labels", {}),
+        "running": sum(1 for a in agents if a.get("status") == "running"),
+    }
+
+
+# ---- commands --------------------------------------------------------------
+
+def find_paseo():
+    for hint in PATH_HINTS:
+        candidate = Path(os.path.expanduser(hint)) / "paseo"
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("paseo") or "paseo"
+
+
+def parse_agent(text, mode):
+    provider, _, model = text.partition("/")
+    agent = {"provider": provider}
+    if model:
+        agent["model"] = model
+    if mode:
+        agent["mode"] = mode
+    return agent
+
+
+def link_skill():
+    source = HERE / "skills" / "fleet"
+    for folder in SKILL_DIRS:
+        base = Path.home() / folder
+        if not base.is_dir():
+            continue
+        target = base / "fleet"
+        if target.is_symlink() or not target.exists():
+            if target.is_symlink():
+                target.unlink()
+            target.symlink_to(source)
+
+
+def unlink_skill():
+    for folder in SKILL_DIRS:
+        target = Path.home() / folder / "fleet"
+        if target.is_symlink():
+            target.unlink()
+
+
+def install_timer():
+    command = f"{sys.executable} {HERE / 'fleet'} report"
+    if sys.platform == "darwin":
+        LAUNCHD.parent.mkdir(parents=True, exist_ok=True)
+        LAUNCHD.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.fleet.report</string>
+<key>ProgramArguments</key><array><string>{sys.executable}</string><string>{HERE / 'fleet'}</string><string>report</string></array>
+<key>StartInterval</key><integer>120</integer><key>RunAtLoad</key><true/>
+<key>StandardErrorPath</key><string>{DATA / 'report.log'}</string>
+</dict></plist>
+""")
+        subprocess.run(["launchctl", "unload", str(LAUNCHD)], capture_output=True)
+        subprocess.run(["launchctl", "load", str(LAUNCHD)], check=True)
+        return "launchd 每 2 分钟"
+    current = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+    lines = [line for line in current.splitlines() if CRON_TAG not in line]
+    lines.append(f"*/2 * * * * {command} >> {DATA / 'report.log'} 2>&1 {CRON_TAG}")
+    subprocess.run(["crontab", "-"], input="\n".join(lines) + "\n", text=True, check=True)
+    return "cron 每 2 分钟"
+
+
+def remove_timer():
+    if sys.platform == "darwin":
+        if LAUNCHD.exists():
+            subprocess.run(["launchctl", "unload", str(LAUNCHD)], capture_output=True)
+            LAUNCHD.unlink()
+        return
+    current = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+    kept = [line for line in current.splitlines() if CRON_TAG not in line]
+    subprocess.run(["crontab", "-"], input="\n".join(kept) + ("\n" if kept else ""), text=True)
+
+
+def cmd_join(args):
+    old = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+    config = {
+        "node_id": old.get("node_id") if old.get("name") == args.name else uuid.uuid4().hex,
+        "name": args.name,
+        "hub": args.hub.rstrip("/"),
+        "role": "edge" if args.edge else "node",
+        "agent": parse_agent(args.agent, args.mode),
+        "labels": dict(label.split("=", 1) for label in args.label),
+        "paseo": find_paseo(),
+        "path": PATH_HINTS,
+    }
+    for folder in ("work", "outbox", "tasks"):
+        (DATA / folder).mkdir(parents=True, exist_ok=True)
+    save_config(config)
+    link_skill()
+    if args.edge:
+        print(f"{args.name} 以边缘节点加入：它连不到中心，由中心通过 SSH 来取上报和待发任务。")
+        print(f"在中心上执行：fleet edge-add {args.name} --ssh 'ssh -o BatchMode=yes <从中心登录这台的地址>'")
+        return
+    joined = call_hub(config, "POST", "/api/join", {"name": args.name, "node_id": config["node_id"], "info": gather(config)})
+    config["node_id"] = joined["node_id"]
+    save_config(config)
+    timer = install_timer()
+    print(f"{args.name} 已加入 {config['hub']}，连法：{joined.get('via')}，默认 Agent：{args.agent}，心跳：{timer}")
+
+
+def cmd_leave(args):
+    config = load_config()
+    if config.get("role") != "edge":
+        call_hub(config, "POST", "/api/leave", {"node_id": config["node_id"]})
+    remove_timer()
+    unlink_skill()
+    CONFIG.unlink()
+    print(f"{config['name']} 已离开机群")
+
+
+def cmd_report(args):
+    config = load_config()
+    info = gather(config)
+    if args.stdout:
+        print(json.dumps(info, ensure_ascii=False))
+        return
+    call_hub(config, "POST", "/api/heartbeat", {"node_id": config["node_id"], "info": info})
+    roster = call_hub(config, "GET", "/api/nodes")
+    (DATA / "nodes.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2))
+
+
+def roster(config):
+    if config.get("role") == "edge":
+        try:
+            return json.loads((DATA / "nodes.json").read_text())
+        except FileNotFoundError:
+            fail("中心还没把通讯录推过来")
+    return call_hub(config, "GET", "/api/nodes")
+
+
+def cmd_nodes(args):
+    config = load_config()
+    nodes = roster(config)
+    if args.json:
+        print(json.dumps(nodes, ensure_ascii=False, indent=2))
+        return
+    for n in nodes:
+        agent = n.get("agent") or {}
+        model = "/".join(x for x in (agent.get("provider"), agent.get("model")) if x)
+        me = " ← 本机" if n["name"] == config["name"] else ""
+        state = "在线" if n.get("online") else "离线"
+        labels = " ".join(f"{k}={v}" for k, v in (n.get("labels") or {}).items())
+        print(f"{n['name']:<10} {state}  {n.get('role', 'node'):<5} {model:<28} {n.get('via') or '-':<7} 在跑 {n.get('running', 0)}  {labels}{me}")
+
+
+def cmd_run(args):
+    config = load_config()
+    prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
+    # From inside a Paseo agent, record which agent sent it.
+    agent_id = os.environ.get("PASEO_AGENT_ID", "")[:8]
+    sender = args.sender or (f"{config['name']}/{agent_id}" if agent_id else config["name"])
+    task = {"from": sender, "to": args.node, "prompt": prompt, "title": args.title}
+    if args.agent:
+        task["agent"] = parse_agent(args.agent, args.mode)
+    if args.cwd:
+        task["cwd"] = args.cwd
+    if config.get("role") == "edge":
+        path = DATA / "outbox" / f"{int(time.time() * 1000)}.json"
+        path.write_text(json.dumps(task, ensure_ascii=False))
+        print(f"已放进待发箱，中心约 1 分钟内取走：{path}")
+        return
+    created = call_hub(config, "POST", "/api/tasks", task)
+    print(f"#{created['id']} 已派给 {args.node}（{created['agent']}），记录：{created['path']}")
+    if args.wait:
+        while True:
+            time.sleep(15)
+            task = call_hub(config, "GET", f"/api/tasks/{created['id']}")
+            if task["status"] in ("done", "failed"):
+                print(f"\n[{task['status']}]\n{task['result']}")
+                return
+
+
+def cmd_ls(args):
+    config = load_config()
+    if config.get("role") == "edge":
+        for path in sorted((DATA / "tasks").glob("*/*.md"), reverse=True)[: args.n]:
+            print(path)
+        return
+    query = "&".join(f"{k}={v}" for k, v in (("to", args.to), ("from", args.sender), ("status", args.status)) if v)
+    for t in call_hub(config, "GET", f"/api/tasks?limit={args.n}&{query}"):
+        print(f"#{t['id']:<5} {t['created']}  {t['from']} → {t['to']:<8} {t['status']:<8} {t['title']}")
+
+
+def cmd_show(args):
+    config = load_config()
+    if config.get("role") == "edge":
+        matches = list((DATA / "tasks").glob(f"*/{int(args.id):04d}-*.md"))
+        print(matches[0].read_text() if matches else "还没同步到这个任务")
+        return
+    task = call_hub(config, "GET", f"/api/tasks/{args.id}")
+    print(Path(task["path"]).read_text() if Path(task["path"]).exists() else json.dumps(task, ensure_ascii=False, indent=2))
+
+
+def cmd_outbox(args):
+    items = []
+    for path in sorted((DATA / "outbox").glob("*.json")):
+        items.append(json.loads(path.read_text()))
+        if args.drain:
+            path.unlink()
+    print(json.dumps(items, ensure_ascii=False))
+
+
+def cmd_edge_add(args):
+    config = load_config()
+    node = call_hub(config, "POST", "/api/edges", {"name": args.name, "ssh": args.ssh})
+    print(f"{node['name']} 已登记为边缘节点，中心每分钟通过 SSH 同步一次")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="fleet", description="机群：查看机器、派活、看记录")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("join", help="加入机群")
+    p.add_argument("hub", help="中心地址，如 http://10.0.0.1:6780")
+    p.add_argument("--name", required=True)
+    p.add_argument("--agent", required=True, help="默认 Agent，provider/model，如 traecli/gpt-6.2-sol/high")
+    p.add_argument("--mode", help="默认权限模式，如 bypass_permissions、full-access")
+    p.add_argument("--label", action="append", default=[], help="k=v，可重复")
+    p.add_argument("--edge", action="store_true", help="连不到中心的机器")
+    p.set_defaults(func=cmd_join)
+
+    sub.add_parser("leave", help="离开机群").set_defaults(func=cmd_leave)
+
+    p = sub.add_parser("report", help="上报心跳")
+    p.add_argument("--stdout", action="store_true")
+    p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("nodes", help="机器列表")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_nodes)
+
+    p = sub.add_parser("run", help="派活")
+    p.add_argument("node")
+    p.add_argument("prompt", help="任务内容；写 - 从标准输入读")
+    p.add_argument("--title")
+    p.add_argument("--agent", help="不用对方的默认 Agent 时指定 provider/model")
+    p.add_argument("--mode")
+    p.add_argument("--cwd", help="对方机器上的工作目录")
+    p.add_argument("--from", dest="sender", help="记录里的派活人，默认本机名")
+    p.add_argument("--wait", action="store_true", help="等到干完再返回")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("ls", help="派活记录")
+    p.add_argument("--to")
+    p.add_argument("--from", dest="sender")
+    p.add_argument("--status")
+    p.add_argument("-n", type=int, default=20)
+    p.set_defaults(func=cmd_ls)
+
+    p = sub.add_parser("show", help="看一条派活")
+    p.add_argument("id")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("outbox", help="边缘节点的待发箱")
+    p.add_argument("--drain", action="store_true")
+    p.set_defaults(func=cmd_outbox)
+
+    p = sub.add_parser("edge-add", help="在中心登记一台边缘节点")
+    p.add_argument("name")
+    p.add_argument("--ssh", required=True, help="中心登录它的 ssh 命令")
+    p.set_defaults(func=cmd_edge_add)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
