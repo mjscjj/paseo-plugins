@@ -275,7 +275,10 @@ def stop_task(task_id):
     if meta.get("paseo_agent"):
         paseo(["stop", meta["paseo_agent"]], node.get("endpoint"))
     log(f"task #{task_id} stopped")
-    return update_task(path, status="stopped", finished=stamp(), result=(meta.get("result") if meta.get("result") != NO_RESULT else "") or "被叫停")
+    stopped = update_task(path, status="stopped", finished=stamp(), result=(meta.get("result") if meta.get("result") != NO_RESULT else "") or "被叫停")
+    if meta.get("paseo_agent"):
+        threading.Thread(target=tidy, args=(stopped, node), daemon=True).start()
+    return stopped
 
 
 def list_tasks(query):
@@ -307,6 +310,31 @@ def paseo(args, endpoint, timeout=120):
 def replies(agent_id, endpoint):
     logs = paseo(["logs", agent_id, "--json"], endpoint)
     return [i["text"].strip() for i in logs.get("items", []) if i.get("type") == "assistant_message" and i.get("text", "").strip()]
+
+
+def tidy(meta, node):
+    """A finished task leaves nothing open in the target's Paseo: archive its agent
+    (the whole workspace when the task was alone in it) and drop the shared
+    ~/fleet/work project once nothing there is live. Replies still reach an
+    archived agent; it comes back on its own."""
+    endpoint, agent_id = node.get("endpoint"), meta.get("paseo_agent")
+    try:
+        agents = paseo(["ls", "--json"], endpoint)
+        mine = next((a for a in agents if a["id"] == agent_id), None)
+        workspace = mine and mine.get("workspaceId")
+        if workspace and not any(a["workspaceId"] == workspace and a["id"] != agent_id for a in agents):
+            paseo(["workspace", "archive", workspace], endpoint)
+        else:
+            paseo(["archive", agent_id], endpoint)
+        work_dir = node.get("cwd")
+        busy = any(read_task(p).get("status") not in DONE and read_task(p).get("to") == meta["to"] and read_task(p).get("id") != meta["id"]
+                   for p in task_files()[:200])
+        if work_dir and not busy and not any(w.get("cwd") == work_dir for w in paseo(["workspace", "ls", "--json"], endpoint)):
+            for project in paseo(["project", "ls", "--json"], endpoint):
+                if project.get("path") == work_dir:
+                    paseo(["project", "delete", project["projectId"]], endpoint)
+    except Exception as error:
+        log(f"task #{meta.get('id')} tidy failed: {error}")
 
 
 def start_worker(path, reply=None):
@@ -382,6 +410,7 @@ def work(path, reply=None):
                 result = said[-1] if fresh else "（这一轮没有留下文字结果，去 Paseo 里看过程）"
                 update_task(path, status=final, finished=stamp(), result=result)
                 log(f"task #{meta['id']} {final}")
+                tidy(meta | {"paseo_agent": agent_id}, node)
                 return
             current = "blocked" if state.get("PendingPermissions") else "running"
             if read_task(path).get("status") != current:

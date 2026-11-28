@@ -28,6 +28,8 @@
 
 `fleet run <机器> "任务"` → 中心写 `~/fleet/tasks/<日期>/<编号>-<机器>-<标题>.md`（`queued`）→ 在目标 daemon 上用它的默认 Agent 创建一个 Agent，工作目录默认是对方的 `~/fleet/work`（`running`，记下 Paseo agent id）→ 每 20 秒看一次，结束后把 Agent 最后一条消息写进「结果」（`done` / `failed`；等审批时是 `blocked`）。中心重启后会接着跟进没结束的任务。
 
+活结束（完成、失败、叫停）后，中心把对方 Paseo 里这次的 Agent 归档（工作区里只有它就归档整个工作区）；`~/fleet/work` 这个项目在那台机器没有别的活、没有活着的工作区时删掉，下次派活会自动再建。追问照样能发给已归档的 Agent，它会自己回来，这一轮结束后再归档。要看过程去 Paseo 的归档里找，任务文件里有 `paseo_agent`。
+
 - `fleet reply <编号> "..."`：干完后接着问同一个 Agent。上一轮结果和这次追问移进「往来」，新结果写进「结果」，`rounds` 加一。还在干的活不能追问，先等或者 `fleet stop`。
 - `fleet stop <编号>`：停掉对方的 Agent，状态 `stopped`。
 
