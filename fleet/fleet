@@ -244,13 +244,13 @@ def cmd_report(args):
         return
     call_hub(config, "POST", "/api/heartbeat", {"node_id": config["node_id"], "info": info})
     roster = call_hub(config, "GET", "/api/nodes")
-    (DATA / "nodes.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2))
+    (DATA / "roster.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2))
 
 
 def roster(config):
     if config.get("role") == "edge":
         try:
-            return json.loads((DATA / "nodes.json").read_text())
+            return json.loads((DATA / "roster.json").read_text())
         except FileNotFoundError:
             fail("中心还没把通讯录推过来")
     return call_hub(config, "GET", "/api/nodes")

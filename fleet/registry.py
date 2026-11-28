@@ -384,7 +384,7 @@ def sync_edge(node):
         nodes = load_nodes()
         merge_report(nodes[node["name"]], json.loads(report.stdout))
         save_nodes(nodes)
-    ssh(node, 'mkdir -p "$HOME/fleet" && cat > "$HOME/fleet/nodes.json"', json.dumps(roster(), ensure_ascii=False))
+    ssh(node, 'mkdir -p "$HOME/fleet" && cat > "$HOME/fleet/roster.json"', json.dumps(roster(), ensure_ascii=False))
     drained = ssh(node, f"{FLEET_BIN} outbox --drain")
     if drained.returncode == 0 and drained.stdout.strip():
         for item in json.loads(drained.stdout):

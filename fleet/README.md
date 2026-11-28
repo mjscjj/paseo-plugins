@@ -57,4 +57,4 @@ fleet join http://<中心IP>:6780 --name <名字> --agent traecli/gpt-6.2-sol/hi
 
 - `fleet nodes` 里离线：看那台机器的 `~/fleet/report.log`，或手动 `fleet report`。
 - 派出去一直 `queued` 或 `failed`：中心日志 `journalctl --user -u fleet-registry`；连法是 relay 时先在中心试 `paseo ls --host '<配对链接>'`。
-- 数据都在中心 `~/fleet/`：`nodes.json`、`counter`、`tasks/`。
+- 数据都在中心 `~/fleet/`：`nodes.json`（节点表）、`counter`、`tasks/`；各节点的 `~/fleet/roster.json` 是通讯录缓存。
