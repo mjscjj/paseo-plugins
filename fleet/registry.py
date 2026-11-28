@@ -176,13 +176,10 @@ def read_task(path):
         for line in head.splitlines():
             key, _, value = line.partition(":")
             meta[key.strip()] = value.strip()
-    sections = re.split(r"^## ", body, flags=re.M)
-    parts = {}
-    for section in sections[1:]:
-        name, _, content = section.partition("\n")
-        parts[name.strip()] = content.strip()
-    meta["prompt"] = parts.get("任务", "")
-    meta["result"] = parts.get("结果", "")
+    # Only our two headings split the body; the agent's own "## " lines stay in its result.
+    task, _, result = body.partition("\n## 结果\n")
+    meta["prompt"] = task.split("## 任务\n", 1)[-1].strip()
+    meta["result"] = result.strip()
     meta["path"] = str(path)
     return meta
 
